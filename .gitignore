@@ -38,4 +38,9 @@ Thumbs.db
 # Elise backups and bundles
 *_backup.py
 Elise_*.zip
-elise_*_files.zip
+elise_*_files.zip# Elise regression reports
+regression_reports/
+.regression_reports/
+
+# Temporary regression artifacts
+elise-regression-*/
