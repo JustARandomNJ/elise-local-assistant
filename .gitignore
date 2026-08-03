@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Elise runtime data
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local documents and private imports
+documents/
+imports/
+
+# Local configuration
+.env
+*.env
+internet_settings.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+temp/
+tmp/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Elise backups and bundles
+*_backup.py
+Elise_*.zip
+elise_*_files.zip
