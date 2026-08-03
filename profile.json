@@ -1,0 +1,48 @@
+{
+  "profile_version": 1,
+  "assistant_name": "Elise",
+  "memories": [
+    {
+      "content": "The user wants this assistant to be named Elise.",
+      "category": "preference",
+      "status": "confirmed",
+      "confidence": 1.0,
+      "source": "manual_profile"
+    },
+    {
+      "content": "The assistant should continue operating offline but may use internet tools when connected.",
+      "category": "goal",
+      "status": "confirmed",
+      "confidence": 1.0,
+      "source": "manual_profile"
+    },
+    {
+      "content": "The host development computer runs Windows.",
+      "category": "fact",
+      "status": "confirmed",
+      "confidence": 1.0,
+      "source": "manual_profile"
+    },
+    {
+      "content": "The user owns an ESP32-S3.",
+      "category": "fact",
+      "status": "confirmed",
+      "confidence": 1.0,
+      "source": "manual_profile"
+    },
+    {
+      "content": "The user prefers practical and direct feedback.",
+      "category": "preference",
+      "status": "confirmed",
+      "confidence": 1.0,
+      "source": "manual_profile"
+    },
+    {
+      "content": "The user is developing Elise on the existing computer before purchasing dedicated hardware.",
+      "category": "project",
+      "status": "confirmed",
+      "confidence": 1.0,
+      "source": "manual_profile"
+    }
+  ]
+}
