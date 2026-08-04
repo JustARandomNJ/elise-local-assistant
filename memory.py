@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import json
 import re
 import sqlite3
@@ -19,6 +20,18 @@ ALLOWED_STATUSES = {
     "confirmed",
     "observed",
     "hypothesis",
+}
+
+ALLOWED_SUGGESTION_RELATIONS = {
+    "new",
+    "conflict",
+}
+
+ALLOWED_SUGGESTION_STATUSES = {
+    "pending",
+    "approved",
+    "rejected",
+    "duplicate",
 }
 
 
@@ -176,6 +189,33 @@ class MemoryStore:
                     source TEXT NOT NULL DEFAULT 'user',
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_suggestions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    content TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    confidence REAL NOT NULL,
+                    relation TEXT NOT NULL,
+                    related_memory_id INTEGER,
+                    reason TEXT NOT NULL,
+                    source_hash TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT,
+                    FOREIGN KEY (related_memory_id)
+                        REFERENCES memories(id)
+                        ON DELETE SET NULL
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS
+                    idx_memory_suggestions_status
+                    ON memory_suggestions(status, id)
                 """
             )
 
@@ -708,6 +748,692 @@ class MemoryStore:
                     selected_rows.append(row)
 
         return selected_rows
+
+    def get(
+        self,
+        memory_id: int,
+    ) -> sqlite3.Row | None:
+        """Return one memory by ID."""
+
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    content,
+                    category,
+                    status,
+                    confidence,
+                    source,
+                    created_at
+                FROM memories
+                WHERE id = ?
+                """,
+                (
+                    int(
+                        memory_id
+                    ),
+                ),
+            ).fetchone()
+
+    def update(
+        self,
+        memory_id: int,
+        *,
+        content: str,
+        category: str,
+        status: str = "confirmed",
+        confidence: float = 1.0,
+        source: str = "memory_update",
+    ) -> bool:
+        """Replace one existing memory after validation."""
+
+        (
+            cleaned_content,
+            cleaned_category,
+            cleaned_status,
+            cleaned_confidence,
+        ) = self._validate_memory(
+            content=content,
+            category=category,
+            status=status,
+            confidence=confidence,
+        )
+        cleaned_source = (
+            source.strip()
+            or "memory_update"
+        )
+
+        with self._connect() as connection:
+            existing = connection.execute(
+                """
+                SELECT id
+                FROM memories
+                WHERE id = ?
+                """,
+                (
+                    int(
+                        memory_id
+                    ),
+                ),
+            ).fetchone()
+
+            if existing is None:
+                return False
+
+            duplicate = connection.execute(
+                """
+                SELECT id
+                FROM memories
+                WHERE content = ?
+                  AND id <> ?
+                """,
+                (
+                    cleaned_content,
+                    int(
+                        memory_id
+                    ),
+                ),
+            ).fetchone()
+
+            if duplicate is not None:
+                raise ValueError(
+                    "An identical memory already exists."
+                )
+
+            cursor = connection.execute(
+                """
+                UPDATE memories
+                SET content = ?,
+                    category = ?,
+                    status = ?,
+                    confidence = ?,
+                    source = ?
+                WHERE id = ?
+                """,
+                (
+                    cleaned_content,
+                    cleaned_category,
+                    cleaned_status,
+                    cleaned_confidence,
+                    cleaned_source,
+                    int(
+                        memory_id
+                    ),
+                ),
+            )
+
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _utc_now() -> str:
+        return datetime.now(
+            timezone.utc
+        ).isoformat(
+            timespec="seconds"
+        )
+
+    def create_suggestion(
+        self,
+        *,
+        content: str,
+        category: str,
+        confidence: float,
+        relation: str,
+        related_memory_id: int | None,
+        reason: str,
+        source_hash: str,
+    ) -> int | None:
+        """
+        Store one approval-gated memory suggestion.
+
+        Returns None when the same pending suggestion already exists or when
+        identical memory content is already confirmed.
+        """
+
+        (
+            cleaned_content,
+            cleaned_category,
+            _,
+            cleaned_confidence,
+        ) = self._validate_memory(
+            content=content,
+            category=category,
+            status="confirmed",
+            confidence=confidence,
+        )
+        cleaned_relation = (
+            relation.strip().lower()
+        )
+        cleaned_reason = " ".join(
+            reason.strip().split()
+        )
+        cleaned_hash = (
+            source_hash.strip().lower()
+        )
+
+        if (
+            cleaned_relation
+            not in ALLOWED_SUGGESTION_RELATIONS
+        ):
+            raise ValueError(
+                "Invalid suggestion relation. Use: "
+                + ", ".join(
+                    sorted(
+                        ALLOWED_SUGGESTION_RELATIONS
+                    )
+                )
+            )
+
+        if not cleaned_reason:
+            raise ValueError(
+                "Suggestion reason cannot be empty."
+            )
+
+        if len(
+            cleaned_reason
+        ) > 500:
+            raise ValueError(
+                "Suggestion reason is too long."
+            )
+
+        if not re.fullmatch(
+            r"[0-9a-f]{64}",
+            cleaned_hash,
+        ):
+            raise ValueError(
+                "Suggestion source hash must be a SHA-256 hex digest."
+            )
+
+        if (
+            cleaned_relation
+            == "conflict"
+            and related_memory_id
+            is None
+        ):
+            raise ValueError(
+                "A conflict suggestion requires a related memory ID."
+            )
+
+        with self._connect() as connection:
+            existing_memory = connection.execute(
+                """
+                SELECT id
+                FROM memories
+                WHERE content = ?
+                """,
+                (
+                    cleaned_content,
+                ),
+            ).fetchone()
+
+            if existing_memory is not None:
+                return None
+
+            existing_pending = connection.execute(
+                """
+                SELECT id
+                FROM memory_suggestions
+                WHERE content = ?
+                  AND status = 'pending'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (
+                    cleaned_content,
+                ),
+            ).fetchone()
+
+            if existing_pending is not None:
+                return None
+
+            if related_memory_id is not None:
+                related = connection.execute(
+                    """
+                    SELECT id
+                    FROM memories
+                    WHERE id = ?
+                    """,
+                    (
+                        int(
+                            related_memory_id
+                        ),
+                    ),
+                ).fetchone()
+
+                if related is None:
+                    raise ValueError(
+                        "Related memory was not found."
+                    )
+
+            cursor = connection.execute(
+                """
+                INSERT INTO memory_suggestions (
+                    content,
+                    category,
+                    confidence,
+                    relation,
+                    related_memory_id,
+                    reason,
+                    source_hash,
+                    status,
+                    created_at,
+                    resolved_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
+                """,
+                (
+                    cleaned_content,
+                    cleaned_category,
+                    cleaned_confidence,
+                    cleaned_relation,
+                    (
+                        None
+                        if related_memory_id
+                        is None
+                        else int(
+                            related_memory_id
+                        )
+                    ),
+                    cleaned_reason,
+                    cleaned_hash,
+                    self._utc_now(),
+                ),
+            )
+
+            return int(
+                cursor.lastrowid
+            )
+
+    def get_suggestion(
+        self,
+        suggestion_id: int,
+    ) -> sqlite3.Row | None:
+        """Return one memory suggestion by ID."""
+
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    content,
+                    category,
+                    confidence,
+                    relation,
+                    related_memory_id,
+                    reason,
+                    source_hash,
+                    status,
+                    created_at,
+                    resolved_at
+                FROM memory_suggestions
+                WHERE id = ?
+                """,
+                (
+                    int(
+                        suggestion_id
+                    ),
+                ),
+            ).fetchone()
+
+    def list_suggestions(
+        self,
+        *,
+        status: str | None = "pending",
+        limit: int = 50,
+    ) -> list[sqlite3.Row]:
+        """List memory suggestions, newest first."""
+
+        safe_limit = max(
+            1,
+            min(
+                int(
+                    limit
+                ),
+                200,
+            ),
+        )
+
+        with self._connect() as connection:
+            if status is None:
+                return connection.execute(
+                    """
+                    SELECT
+                        id,
+                        content,
+                        category,
+                        confidence,
+                        relation,
+                        related_memory_id,
+                        reason,
+                        source_hash,
+                        status,
+                        created_at,
+                        resolved_at
+                    FROM memory_suggestions
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        safe_limit,
+                    ),
+                ).fetchall()
+
+            cleaned_status = (
+                status.strip().lower()
+            )
+
+            if (
+                cleaned_status
+                not in ALLOWED_SUGGESTION_STATUSES
+            ):
+                raise ValueError(
+                    "Invalid suggestion status. Use: "
+                    + ", ".join(
+                        sorted(
+                            ALLOWED_SUGGESTION_STATUSES
+                        )
+                    )
+                )
+
+            return connection.execute(
+                """
+                SELECT
+                    id,
+                    content,
+                    category,
+                    confidence,
+                    relation,
+                    related_memory_id,
+                    reason,
+                    source_hash,
+                    status,
+                    created_at,
+                    resolved_at
+                FROM memory_suggestions
+                WHERE status = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (
+                    cleaned_status,
+                    safe_limit,
+                ),
+            ).fetchall()
+
+    def count_pending_suggestions(
+        self,
+    ) -> int:
+        """Count unresolved memory suggestions."""
+
+        with self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM memory_suggestions
+                WHERE status = 'pending'
+                """
+            ).fetchone()
+
+        return int(
+            row[
+                "count"
+            ]
+        )
+
+    def approve_suggestion(
+        self,
+        suggestion_id: int,
+    ) -> dict[str, Any]:
+        """
+        Approve one pending suggestion.
+
+        New suggestions create a confirmed memory. Conflict suggestions replace
+        the explicitly related memory while preserving its ID.
+        """
+
+        now = self._utc_now()
+
+        with self._connect() as connection:
+            suggestion = connection.execute(
+                """
+                SELECT *
+                FROM memory_suggestions
+                WHERE id = ?
+                """,
+                (
+                    int(
+                        suggestion_id
+                    ),
+                ),
+            ).fetchone()
+
+            if suggestion is None:
+                return {
+                    "success": False,
+                    "error": (
+                        f"Memory suggestion {suggestion_id} was not found."
+                    ),
+                }
+
+            if (
+                suggestion[
+                    "status"
+                ]
+                != "pending"
+            ):
+                return {
+                    "success": False,
+                    "error": (
+                        f"Memory suggestion {suggestion_id} is already "
+                        f"{suggestion['status']}."
+                    ),
+                }
+
+            duplicate = connection.execute(
+                """
+                SELECT id
+                FROM memories
+                WHERE content = ?
+                """,
+                (
+                    suggestion[
+                        "content"
+                    ],
+                ),
+            ).fetchone()
+
+            if duplicate is not None:
+                connection.execute(
+                    """
+                    UPDATE memory_suggestions
+                    SET status = 'duplicate',
+                        resolved_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        now,
+                        int(
+                            suggestion_id
+                        ),
+                    ),
+                )
+
+                return {
+                    "success": True,
+                    "action": "duplicate",
+                    "memory_id": int(
+                        duplicate[
+                            "id"
+                        ]
+                    ),
+                }
+
+            if (
+                suggestion[
+                    "relation"
+                ]
+                == "conflict"
+            ):
+                related_memory_id = (
+                    suggestion[
+                        "related_memory_id"
+                    ]
+                )
+
+                if related_memory_id is None:
+                    return {
+                        "success": False,
+                        "error": (
+                            "Conflict suggestion has no related memory."
+                        ),
+                    }
+
+                existing = connection.execute(
+                    """
+                    SELECT *
+                    FROM memories
+                    WHERE id = ?
+                    """,
+                    (
+                        int(
+                            related_memory_id
+                        ),
+                    ),
+                ).fetchone()
+
+                if existing is None:
+                    return {
+                        "success": False,
+                        "error": (
+                            "The related memory no longer exists."
+                        ),
+                    }
+
+                old_content = str(
+                    existing[
+                        "content"
+                    ]
+                )
+                connection.execute(
+                    """
+                    UPDATE memories
+                    SET content = ?,
+                        category = ?,
+                        status = 'confirmed',
+                        confidence = ?,
+                        source = 'automatic_memory_review'
+                    WHERE id = ?
+                    """,
+                    (
+                        suggestion[
+                            "content"
+                        ],
+                        suggestion[
+                            "category"
+                        ],
+                        float(
+                            suggestion[
+                                "confidence"
+                            ]
+                        ),
+                        int(
+                            related_memory_id
+                        ),
+                    ),
+                )
+                memory_id = int(
+                    related_memory_id
+                )
+                action = "replaced"
+            else:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO memories (
+                        content,
+                        category,
+                        status,
+                        confidence,
+                        source
+                    )
+                    VALUES (?, ?, 'confirmed', ?, 'automatic_memory_review')
+                    """,
+                    (
+                        suggestion[
+                            "content"
+                        ],
+                        suggestion[
+                            "category"
+                        ],
+                        float(
+                            suggestion[
+                                "confidence"
+                            ]
+                        ),
+                    ),
+                )
+                memory_id = int(
+                    cursor.lastrowid
+                )
+                old_content = None
+                action = "created"
+
+            connection.execute(
+                """
+                UPDATE memory_suggestions
+                SET status = 'approved',
+                    resolved_at = ?
+                WHERE id = ?
+                """,
+                (
+                    now,
+                    int(
+                        suggestion_id
+                    ),
+                ),
+            )
+
+            return {
+                "success": True,
+                "action": action,
+                "memory_id": memory_id,
+                "old_content": old_content,
+                "content": str(
+                    suggestion[
+                        "content"
+                    ]
+                ),
+                "category": str(
+                    suggestion[
+                        "category"
+                    ]
+                ),
+            }
+
+    def reject_suggestion(
+        self,
+        suggestion_id: int,
+    ) -> bool:
+        """Reject one pending suggestion."""
+
+        with self._connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE memory_suggestions
+                SET status = 'rejected',
+                    resolved_at = ?
+                WHERE id = ?
+                  AND status = 'pending'
+                """,
+                (
+                    self._utc_now(),
+                    int(
+                        suggestion_id
+                    ),
+                ),
+            )
+
+            return cursor.rowcount == 1
 
     def import_profile(
         self,
