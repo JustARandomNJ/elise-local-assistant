@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, time, timezone
 import json
 import re
 import sqlite3
@@ -21,6 +21,17 @@ ALLOWED_STATUSES = {
     "confirmed",
     "observed",
     "hypothesis",
+}
+
+ALLOWED_PRIVACY_LEVELS = {
+    "ordinary",
+    "personal",
+}
+
+ALLOWED_RETRIEVAL_POLICIES = {
+    "when_relevant",
+    "explicit_only",
+    "never_prompt",
 }
 
 ALLOWED_SUGGESTION_RELATIONS = {
@@ -206,7 +217,11 @@ class MemoryStore:
                     status TEXT NOT NULL DEFAULT 'confirmed',
                     confidence REAL NOT NULL DEFAULT 1.0,
                     source TEXT NOT NULL DEFAULT 'user',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    privacy_level TEXT NOT NULL DEFAULT 'ordinary',
+                    retrieval_policy TEXT NOT NULL DEFAULT 'when_relevant',
+                    expires_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT
                 )
                 """
             )
@@ -221,6 +236,9 @@ class MemoryStore:
                     related_memory_id INTEGER,
                     reason TEXT NOT NULL,
                     source_hash TEXT NOT NULL,
+                    privacy_level TEXT NOT NULL DEFAULT 'ordinary',
+                    retrieval_policy TEXT NOT NULL DEFAULT 'when_relevant',
+                    expires_at TEXT,
                     status TEXT NOT NULL DEFAULT 'pending',
                     created_at TEXT NOT NULL,
                     resolved_at TEXT,
@@ -235,6 +253,27 @@ class MemoryStore:
                 CREATE INDEX IF NOT EXISTS
                     idx_memory_suggestions_status
                     ON memory_suggestions(status, id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_retrieval_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_id INTEGER NOT NULL,
+                    query_hash TEXT NOT NULL,
+                    retrieval_context TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    retrieved_at TEXT NOT NULL,
+                    FOREIGN KEY (memory_id)
+                        REFERENCES memories(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_retrieval_log_time
+                    ON memory_retrieval_log(retrieved_at, id)
                 """
             )
 
@@ -266,6 +305,14 @@ class MemoryStore:
                 "source": (
                     "TEXT NOT NULL DEFAULT 'user'"
                 ),
+                "privacy_level": (
+                    "TEXT NOT NULL DEFAULT 'ordinary'"
+                ),
+                "retrieval_policy": (
+                    "TEXT NOT NULL DEFAULT 'when_relevant'"
+                ),
+                "expires_at": "TEXT",
+                "updated_at": "TEXT",
             }
 
             for (
@@ -282,6 +329,23 @@ class MemoryStore:
                     {column_definition}
                     """
                 )
+
+            suggestion_columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_suggestions)"
+                ).fetchall()
+            }
+            suggestion_missing = {
+                "privacy_level": "TEXT NOT NULL DEFAULT 'ordinary'",
+                "retrieval_policy": "TEXT NOT NULL DEFAULT 'when_relevant'",
+                "expires_at": "TEXT",
+            }
+            for column_name, column_definition in suggestion_missing.items():
+                if column_name not in suggestion_columns:
+                    connection.execute(
+                        f"ALTER TABLE memory_suggestions ADD COLUMN {column_name} {column_definition}"
+                    )
 
     @staticmethod
     def _normalize_token(
@@ -458,6 +522,54 @@ class MemoryStore:
             cleaned_confidence,
         )
 
+    @staticmethod
+    def _normalize_expiration(
+        expires_at: str | None,
+    ) -> str | None:
+        if expires_at is None:
+            return None
+        cleaned = expires_at.strip()
+        if not cleaned or cleaned.lower() == "never":
+            return None
+        try:
+            if re.fullmatch(r"\d{4}-\d{2}-\d{2}", cleaned):
+                parsed = datetime.combine(
+                    date.fromisoformat(cleaned),
+                    time(23, 59, 59),
+                    tzinfo=timezone.utc,
+                )
+            else:
+                parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+        except ValueError as error:
+            raise ValueError("Expiration must be YYYY-MM-DD, an ISO timestamp, or never.") from error
+        return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    @staticmethod
+    def _is_expired(expires_at: str | None) -> bool:
+        if not expires_at:
+            return False
+        parsed = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed <= datetime.now(timezone.utc)
+
+    @classmethod
+    def _validate_privacy(
+        cls,
+        privacy_level: str,
+        retrieval_policy: str,
+        expires_at: str | None,
+    ) -> tuple[str, str, str | None]:
+        cleaned_privacy = privacy_level.strip().lower()
+        cleaned_policy = retrieval_policy.strip().lower()
+        if cleaned_privacy not in ALLOWED_PRIVACY_LEVELS:
+            raise ValueError("Invalid privacy level. Use: " + ", ".join(sorted(ALLOWED_PRIVACY_LEVELS)))
+        if cleaned_policy not in ALLOWED_RETRIEVAL_POLICIES:
+            raise ValueError("Invalid retrieval policy. Use: " + ", ".join(sorted(ALLOWED_RETRIEVAL_POLICIES)))
+        return cleaned_privacy, cleaned_policy, cls._normalize_expiration(expires_at)
+
     def add(
         self,
         content: str,
@@ -465,109 +577,68 @@ class MemoryStore:
         status: str = "confirmed",
         confidence: float = 1.0,
         source: str = "user",
+        privacy_level: str = "ordinary",
+        retrieval_policy: str = "when_relevant",
+        expires_at: str | None = None,
     ) -> bool:
-        """
-        Add one structured memory.
-
-        Returns False when identical content already exists.
-        """
-
-        (
-            cleaned_content,
-            cleaned_category,
-            cleaned_status,
-            cleaned_confidence,
-        ) = self._validate_memory(
-            content=content,
-            category=category,
-            status=status,
-            confidence=confidence,
+        """Add one structured memory, returning False for identical content."""
+        cleaned_content, cleaned_category, cleaned_status, cleaned_confidence = self._validate_memory(
+            content=content, category=category, status=status, confidence=confidence
         )
-
-        cleaned_source = (
-            source.strip()
-            or "unknown"
+        cleaned_privacy, cleaned_policy, cleaned_expiration = self._validate_privacy(
+            privacy_level, retrieval_policy, expires_at
         )
-
+        cleaned_source = source.strip() or "unknown"
+        now = self._utc_now()
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 INSERT OR IGNORE INTO memories (
-                    content,
-                    category,
-                    status,
-                    confidence,
-                    source
-                )
-                VALUES (?, ?, ?, ?, ?)
+                    content, category, status, confidence, source,
+                    privacy_level, retrieval_policy, expires_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (
-                    cleaned_content,
-                    cleaned_category,
-                    cleaned_status,
-                    cleaned_confidence,
-                    cleaned_source,
-                ),
+                (cleaned_content, cleaned_category, cleaned_status, cleaned_confidence,
+                 cleaned_source, cleaned_privacy, cleaned_policy, cleaned_expiration, now),
             )
-
             return cursor.rowcount == 1
 
     def list_all(
         self,
         category: str | None = None,
+        privacy_level: str | None = None,
+        *,
+        include_expired: bool = True,
     ) -> list[sqlite3.Row]:
-        """Return all memories or memories from one category."""
-
+        """Return memories with optional category and privacy filters."""
+        clauses: list[str] = []
+        values: list[Any] = []
+        if category is not None:
+            cleaned_category = category.strip().lower()
+            if cleaned_category not in ALLOWED_CATEGORIES:
+                raise ValueError("Invalid category. Use: " + ", ".join(sorted(ALLOWED_CATEGORIES)))
+            clauses.append("category = ?")
+            values.append(cleaned_category)
+        if privacy_level is not None:
+            cleaned_privacy = privacy_level.strip().lower()
+            if cleaned_privacy not in ALLOWED_PRIVACY_LEVELS:
+                raise ValueError("Invalid privacy level. Use: " + ", ".join(sorted(ALLOWED_PRIVACY_LEVELS)))
+            clauses.append("privacy_level = ?")
+            values.append(cleaned_privacy)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
-            if category is None:
-                return connection.execute(
-                    """
-                    SELECT
-                        id,
-                        content,
-                        category,
-                        status,
-                        confidence,
-                        source,
-                        created_at
-                    FROM memories
-                    ORDER BY id
-                    """
-                ).fetchall()
-
-            cleaned_category = (
-                category.strip().lower()
-            )
-
-            if (
-                cleaned_category
-                not in ALLOWED_CATEGORIES
-            ):
-                raise ValueError(
-                    "Invalid category. Use: "
-                    + ", ".join(
-                        sorted(
-                            ALLOWED_CATEGORIES
-                        )
-                    )
-                )
-
-            return connection.execute(
+            rows = connection.execute(
                 """
-                SELECT
-                    id,
-                    content,
-                    category,
-                    status,
-                    confidence,
-                    source,
-                    created_at
+                SELECT id, content, category, status, confidence, source,
+                       privacy_level, retrieval_policy, expires_at,
+                       created_at, updated_at
                 FROM memories
-                WHERE category = ?
-                ORDER BY id
-                """,
-                (cleaned_category,),
+                """ + where + " ORDER BY id",
+                tuple(values),
             ).fetchall()
+        if include_expired:
+            return rows
+        return [row for row in rows if not self._is_expired(row["expires_at"])]
 
     def delete(
         self,
@@ -586,213 +657,140 @@ class MemoryStore:
 
             return cursor.rowcount == 1
 
+    def _record_retrieval(
+        self,
+        *,
+        memory_id: int,
+        query: str,
+        retrieval_context: str,
+        reason: str,
+    ) -> None:
+        query_hash = __import__("hashlib").sha256(query.encode("utf-8")).hexdigest()
+        with self._connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO memory_retrieval_log (
+                    memory_id, query_hash, retrieval_context, reason, retrieved_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (int(memory_id), query_hash, retrieval_context[:80], reason[:500], self._utc_now()),
+            )
+
+    def recent_retrievals(self, limit: int = 20) -> list[sqlite3.Row]:
+        safe_limit = max(1, min(int(limit), 100))
+        with self._connect() as connection:
+            return connection.execute(
+                """
+                SELECT l.id, l.memory_id, l.query_hash, l.retrieval_context,
+                       l.reason, l.retrieved_at, m.category, m.privacy_level,
+                       m.retrieval_policy
+                FROM memory_retrieval_log AS l
+                LEFT JOIN memories AS m ON m.id = l.memory_id
+                ORDER BY l.id DESC LIMIT ?
+                """,
+                (safe_limit,),
+            ).fetchall()
+
     def search(
         self,
         query: str,
         top_k: int = 6,
+        *,
+        explicit: bool = False,
+        retrieval_context: str = "automatic_chat",
+        log_retrieval: bool = True,
     ) -> list[sqlite3.Row]:
-        """
-        Retrieve persistent memories relevant to a question.
-
-        Confirmed memories and higher-confidence memories receive more weight.
-        """
-
+        """Retrieve policy-eligible, non-expired memories relevant to a query."""
         cleaned_query = query.strip()
-
         if not cleaned_query or top_k <= 0:
             return []
-
-        query_tokens = self._tokenize_query(
-            cleaned_query
-        )
-
+        query_tokens = self._tokenize_query(cleaned_query)
         if not query_tokens:
             return []
-
-        unique_query_tokens = set(
-            query_tokens
-        )
-
-        normalized_query_phrase = " ".join(
-            query_tokens
-        )
-
-        all_memories = self.list_all()
-        scored_memories: list[
-            tuple[float, int]
-        ] = []
-
+        unique_query_tokens = set(query_tokens)
+        normalized_query_phrase = " ".join(query_tokens)
+        all_memories = self.list_all(include_expired=False)
+        scored: list[tuple[float, int, str, str]] = []
         for memory in all_memories:
-            content = memory["content"]
-            category = memory["category"]
-            status = memory["status"]
-            source = memory["source"]
-            confidence = float(
-                memory["confidence"]
-            )
-
-            content_tokens = self._tokenize(
-                content
-            )
-
-            metadata_tokens = set(
-                self._tokenize(
-                    f"{category} {status} {source}"
-                )
-            )
-
+            policy = str(memory["retrieval_policy"])
+            if policy == "never_prompt":
+                continue
+            if policy == "explicit_only" and not explicit:
+                continue
+            content = str(memory["content"])
+            category = str(memory["category"])
+            status = str(memory["status"])
+            source = str(memory["source"])
+            confidence = float(memory["confidence"])
+            content_tokens = self._tokenize(content)
+            metadata_tokens = set(self._tokenize(
+                f"{category} {status} {source} {memory['privacy_level']} {policy}"
+            ))
             token_counts: dict[str, int] = {}
-
             for token in content_tokens:
-                token_counts[token] = (
-                    token_counts.get(
-                        token,
-                        0,
-                    )
-                    + 1
-                )
-
+                token_counts[token] = token_counts.get(token, 0) + 1
             matched_tokens: set[str] = set()
             base_score = 0.0
-
             for token in unique_query_tokens:
-                content_frequency = (
-                    token_counts.get(
-                        token,
-                        0,
-                    )
-                )
-
-                if content_frequency > 0:
+                frequency = token_counts.get(token, 0)
+                if frequency:
                     matched_tokens.add(token)
-                    base_score += min(
-                        content_frequency,
-                        4,
-                    )
-
+                    base_score += min(frequency, 4)
                 if token in metadata_tokens:
                     matched_tokens.add(token)
                     base_score += 1.5
-
             if not matched_tokens:
                 continue
-
-            coverage = (
-                len(matched_tokens)
-                / len(unique_query_tokens)
-            )
-
+            coverage = len(matched_tokens) / len(unique_query_tokens)
             base_score += coverage * 4.0
-
-            normalized_content = " ".join(
-                content_tokens
-            )
-
-            if (
-                normalized_query_phrase
-                and normalized_query_phrase
-                in normalized_content
-            ):
+            normalized_content = " ".join(content_tokens)
+            if normalized_query_phrase and normalized_query_phrase in normalized_content:
                 base_score += 5.0
-
-            if (
-                len(matched_tokens)
-                == len(unique_query_tokens)
-            ):
+            if len(matched_tokens) == len(unique_query_tokens):
                 base_score += 2.0
-
-            status_weight = (
-                STATUS_WEIGHTS.get(
-                    status,
-                    0.75,
-                )
+            final_score = base_score * STATUS_WEIGHTS.get(status, 0.75) * (0.5 + confidence * 0.5)
+            terms = ", ".join(sorted(matched_tokens))
+            reason = (
+                f"{retrieval_context} matched terms: {terms}; "
+                f"privacy={memory['privacy_level']}; policy={policy}"
             )
-
-            confidence_weight = (
-                0.5
-                + (confidence * 0.5)
-            )
-
-            final_score = (
-                base_score
-                * status_weight
-                * confidence_weight
-            )
-
-            scored_memories.append(
-                (
-                    final_score,
-                    int(memory["id"]),
-                )
-            )
-
-        scored_memories.sort(
-            key=lambda item: (
-                item[0],
-                item[1],
-            ),
-            reverse=True,
-        )
-
-        selected_rows: list[
-            sqlite3.Row
-        ] = []
-
+            scored.append((final_score, int(memory["id"]), terms, reason))
+        scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        rows: list[sqlite3.Row] = []
         with self._connect() as connection:
-            for (
-                score,
-                memory_id,
-            ) in scored_memories[:top_k]:
+            for score, memory_id, terms, reason in scored[:top_k]:
                 row = connection.execute(
                     """
-                    SELECT
-                        id,
-                        content,
-                        category,
-                        status,
-                        confidence,
-                        source,
-                        created_at,
-                        ? AS relevance_score
-                    FROM memories
-                    WHERE id = ?
+                    SELECT id, content, category, status, confidence, source,
+                           privacy_level, retrieval_policy, expires_at,
+                           created_at, updated_at,
+                           ? AS relevance_score, ? AS matched_terms,
+                           ? AS retrieval_reason
+                    FROM memories WHERE id = ?
                     """,
-                    (
-                        score,
-                        memory_id,
-                    ),
+                    (score, terms, reason, memory_id),
                 ).fetchone()
-
                 if row is not None:
-                    selected_rows.append(row)
+                    rows.append(row)
+        if log_retrieval:
+            for row in rows:
+                self._record_retrieval(
+                    memory_id=int(row["id"]), query=cleaned_query,
+                    retrieval_context=retrieval_context,
+                    reason=str(row["retrieval_reason"]),
+                )
+        return rows
 
-        return selected_rows
-
-    def get(
-        self,
-        memory_id: int,
-    ) -> sqlite3.Row | None:
-        """Return one memory by ID."""
-
+    def get(self, memory_id: int) -> sqlite3.Row | None:
         with self._connect() as connection:
             return connection.execute(
                 """
-                SELECT
-                    id,
-                    content,
-                    category,
-                    status,
-                    confidence,
-                    source,
-                    created_at
-                FROM memories
-                WHERE id = ?
+                SELECT id, content, category, status, confidence, source,
+                       privacy_level, retrieval_policy, expires_at,
+                       created_at, updated_at
+                FROM memories WHERE id = ?
                 """,
-                (
-                    int(
-                        memory_id
-                    ),
-                ),
+                (int(memory_id),),
             ).fetchone()
 
     def update(
@@ -804,84 +802,67 @@ class MemoryStore:
         status: str = "confirmed",
         confidence: float = 1.0,
         source: str = "memory_update",
+        privacy_level: str | None = None,
+        retrieval_policy: str | None = None,
+        expires_at: str | None = None,
+        preserve_expiration: bool = True,
     ) -> bool:
-        """Replace one existing memory after validation."""
-
-        (
-            cleaned_content,
-            cleaned_category,
-            cleaned_status,
-            cleaned_confidence,
-        ) = self._validate_memory(
-            content=content,
-            category=category,
-            status=status,
-            confidence=confidence,
+        cleaned_content, cleaned_category, cleaned_status, cleaned_confidence = self._validate_memory(
+            content=content, category=category, status=status, confidence=confidence
         )
-        cleaned_source = (
-            source.strip()
-            or "memory_update"
-        )
-
         with self._connect() as connection:
-            existing = connection.execute(
-                """
-                SELECT id
-                FROM memories
-                WHERE id = ?
-                """,
-                (
-                    int(
-                        memory_id
-                    ),
-                ),
-            ).fetchone()
-
+            existing = connection.execute("SELECT * FROM memories WHERE id = ?", (int(memory_id),)).fetchone()
             if existing is None:
                 return False
-
             duplicate = connection.execute(
-                """
-                SELECT id
-                FROM memories
-                WHERE content = ?
-                  AND id <> ?
-                """,
-                (
-                    cleaned_content,
-                    int(
-                        memory_id
-                    ),
-                ),
+                "SELECT id FROM memories WHERE content = ? AND id <> ?",
+                (cleaned_content, int(memory_id)),
             ).fetchone()
-
             if duplicate is not None:
-                raise ValueError(
-                    "An identical memory already exists."
-                )
-
+                raise ValueError("An identical memory already exists.")
+            chosen_privacy = str(existing["privacy_level"]) if privacy_level is None else privacy_level
+            chosen_policy = str(existing["retrieval_policy"]) if retrieval_policy is None else retrieval_policy
+            if preserve_expiration and expires_at is None:
+                chosen_expiration = existing["expires_at"]
+            else:
+                chosen_expiration = expires_at
+            clean_privacy, clean_policy, clean_expiration = self._validate_privacy(
+                chosen_privacy, chosen_policy, chosen_expiration
+            )
             cursor = connection.execute(
                 """
-                UPDATE memories
-                SET content = ?,
-                    category = ?,
-                    status = ?,
-                    confidence = ?,
-                    source = ?
+                UPDATE memories SET content = ?, category = ?, status = ?,
+                    confidence = ?, source = ?, privacy_level = ?,
+                    retrieval_policy = ?, expires_at = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (
-                    cleaned_content,
-                    cleaned_category,
-                    cleaned_status,
-                    cleaned_confidence,
-                    cleaned_source,
-                    int(
-                        memory_id
-                    ),
-                ),
+                (cleaned_content, cleaned_category, cleaned_status, cleaned_confidence,
+                 source.strip() or "memory_update", clean_privacy, clean_policy,
+                 clean_expiration, self._utc_now(), int(memory_id)),
             )
+            return cursor.rowcount == 1
 
+    def set_retrieval_policy(self, memory_id: int, policy: str) -> bool:
+        row = self.get(memory_id)
+        if row is None:
+            return False
+        _, cleaned_policy, _ = self._validate_privacy(
+            str(row["privacy_level"]), policy, row["expires_at"]
+        )
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE memories SET retrieval_policy = ?, updated_at = ? WHERE id = ?",
+                (cleaned_policy, self._utc_now(), int(memory_id)),
+            )
+            return cursor.rowcount == 1
+
+    def set_expiration(self, memory_id: int, expires_at: str | None) -> bool:
+        cleaned = self._normalize_expiration(expires_at)
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE memories SET expires_at = ?, updated_at = ? WHERE id = ?",
+                (cleaned, self._utc_now(), int(memory_id)),
+            )
             return cursor.rowcount == 1
 
     @staticmethod
@@ -902,6 +883,9 @@ class MemoryStore:
         related_memory_id: int | None,
         reason: str,
         source_hash: str,
+        privacy_level: str = "ordinary",
+        retrieval_policy: str = "when_relevant",
+        expires_at: str | None = None,
     ) -> int | None:
         """
         Store one approval-gated memory suggestion.
@@ -929,6 +913,9 @@ class MemoryStore:
         )
         cleaned_hash = (
             source_hash.strip().lower()
+        )
+        cleaned_privacy, cleaned_policy, cleaned_expiration = self._validate_privacy(
+            privacy_level, retrieval_policy, expires_at
         )
 
         if (
@@ -1035,11 +1022,14 @@ class MemoryStore:
                     related_memory_id,
                     reason,
                     source_hash,
+                    privacy_level,
+                    retrieval_policy,
+                    expires_at,
                     status,
                     created_at,
                     resolved_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, NULL)
                 """,
                 (
                     cleaned_content,
@@ -1056,6 +1046,9 @@ class MemoryStore:
                     ),
                     cleaned_reason,
                     cleaned_hash,
+                    cleaned_privacy,
+                    cleaned_policy,
+                    cleaned_expiration,
                     self._utc_now(),
                 ),
             )
@@ -1082,6 +1075,9 @@ class MemoryStore:
                     related_memory_id,
                     reason,
                     source_hash,
+                    privacy_level,
+                    retrieval_policy,
+                    expires_at,
                     status,
                     created_at,
                     resolved_at
@@ -1166,6 +1162,9 @@ class MemoryStore:
                     related_memory_id,
                     reason,
                     source_hash,
+                    privacy_level,
+                    retrieval_policy,
+                    expires_at,
                     status,
                     created_at,
                     resolved_at
@@ -1341,7 +1340,11 @@ class MemoryStore:
                         category = ?,
                         status = 'confirmed',
                         confidence = ?,
-                        source = 'automatic_memory_review'
+                        source = 'automatic_memory_review',
+                        privacy_level = ?,
+                        retrieval_policy = ?,
+                        expires_at = ?,
+                        updated_at = ?
                     WHERE id = ?
                     """,
                     (
@@ -1356,6 +1359,10 @@ class MemoryStore:
                                 "confidence"
                             ]
                         ),
+                        suggestion["privacy_level"],
+                        suggestion["retrieval_policy"],
+                        suggestion["expires_at"],
+                        now,
                         int(
                             related_memory_id
                         ),
@@ -1373,9 +1380,13 @@ class MemoryStore:
                         category,
                         status,
                         confidence,
-                        source
+                        source,
+                        privacy_level,
+                        retrieval_policy,
+                        expires_at,
+                        updated_at
                     )
-                    VALUES (?, ?, 'confirmed', ?, 'automatic_memory_review')
+                    VALUES (?, ?, 'confirmed', ?, 'automatic_memory_review', ?, ?, ?, ?)
                     """,
                     (
                         suggestion[
@@ -1389,6 +1400,10 @@ class MemoryStore:
                                 "confidence"
                             ]
                         ),
+                        suggestion["privacy_level"],
+                        suggestion["retrieval_policy"],
+                        suggestion["expires_at"],
+                        now,
                     ),
                 )
                 memory_id = int(
@@ -1427,6 +1442,9 @@ class MemoryStore:
                         "category"
                     ]
                 ),
+                "privacy_level": str(suggestion["privacy_level"]),
+                "retrieval_policy": str(suggestion["retrieval_policy"]),
+                "expires_at": suggestion["expires_at"],
             }
 
     def reject_suggestion(
@@ -1545,65 +1563,24 @@ class MemoryStore:
 
     def build_prompt(
         self,
-        memories: Sequence[
-            sqlite3.Row
-        ] | None = None,
+        memories: Sequence[sqlite3.Row] | None = None,
     ) -> str:
-        """
-        Format selected memories for inclusion in Elise's prompt.
-
-        Passing None formats every memory for backward compatibility.
-        Passing an empty sequence reports that no relevant memories were found.
-        """
-
         if memories is None:
-            selected_memories = (
-                self.list_all()
-            )
+            selected_memories = self.list_all(include_expired=False)
         else:
-            selected_memories = list(
-                memories
-            )
-
+            selected_memories = list(memories)
         if not selected_memories:
-            return (
-                "No relevant persistent "
-                "memories were retrieved."
-            )
-
-        grouped: dict[
-            str,
-            list[str],
-        ] = {}
-
+            return "No relevant persistent memories were retrieved."
+        grouped: dict[str, list[str]] = {}
         for memory in selected_memories:
-            category = memory["category"]
-
-            grouped.setdefault(
-                category,
-                [],
-            ).append(
-                (
-                    f"- Memory {memory['id']} "
-                    f"[{memory['status']}; "
-                    f"confidence "
-                    f"{memory['confidence']:.2f}] "
-                    f"{memory['content']}"
-                )
+            category = str(memory["category"])
+            grouped.setdefault(category, []).append(
+                f"- Memory {memory['id']} [{memory['privacy_level']}; "
+                f"{memory['retrieval_policy']}; {memory['status']}; "
+                f"confidence {memory['confidence']:.2f}] {memory['content']}"
             )
+        return "\n\n".join(
+            category.upper() + ":\n" + "\n".join(items)
+            for category, items in grouped.items()
+        )
 
-        sections: list[str] = []
-
-        for (
-            category,
-            category_memories,
-        ) in grouped.items():
-            sections.append(
-                category.upper()
-                + ":\n"
-                + "\n".join(
-                    category_memories
-                )
-            )
-
-        return "\n\n".join(sections)
