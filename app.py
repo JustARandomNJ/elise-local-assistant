@@ -28,6 +28,15 @@ from memory_review import (
     build_memory_review_messages,
     is_likely_memory_declaration,
 )
+from profile_import import (
+    ProfileDocument,
+    ProfileImportEngine,
+    ProfileImportReport,
+    ProfileMemoryItem,
+    build_profile_relation_messages,
+    load_profile,
+    parse_profile_relation,
+)
 from tools import ToolManager
 from workflow import (
     WorkflowNotFoundError,
@@ -54,7 +63,7 @@ MEMORY_RESULTS_PER_QUERY = 6
 
 
 CURRENT_PROJECT_STATE = """
-Elise version: 1.1.0-dev4.2
+Elise version: 1.1.0-dev5.1
 
 Completed and currently working:
 - Ollama is installed on Windows.
@@ -66,7 +75,13 @@ Completed and currently working:
 - Temporary conversation context is working.
 - Persistent SQLite memory is working.
 - Memories have categories, status, confidence, and source.
-- JSON profile importing is working.
+- JSON profile imports are previewed and staged as approval-gated memory suggestions.
+- Profile imports never write directly to confirmed memory.
+- Imported items receive strict schema validation, privacy filtering, duplicate
+  checks, and host-validated conflict classification.
+- SQLite memory connections close deterministically so temporary databases are not
+  left locked on Windows.
+- Profile reports render normal blank lines rather than literal escape markers.
 - Basic offline local-document indexing is working.
 - Basic keyword search across text-based local documents is working.
 - Generic search terms are filtered to reduce irrelevant document retrieval.
@@ -853,8 +868,11 @@ def print_help() -> None:
         "  /forget <id>\n"
         "      Delete one persistent memory.\n"
         "\n"
+        "  /preview-profile <file>\n"
+        "      Validate and preview a JSON profile without changing memory.\n"
+        "\n"
         "  /import-profile <file>\n"
-        "      Import memories from a JSON profile.\n"
+        "      Stage profile items as approval-gated memory suggestions.\n"
         "\n"
         "  /documents\n"
         "      Show indexed local documents.\n"
@@ -3663,13 +3681,243 @@ def handle_forget_command(
         )
 
 
+def resolve_profile_path(
+    raw_path: str,
+) -> Path:
+    profile_path = Path(
+        raw_path
+    )
+
+    if not profile_path.is_absolute():
+        profile_path = (
+            BASE_DIRECTORY
+            / profile_path
+        )
+
+    return profile_path.resolve()
+
+
+def classify_profile_memory(
+    item: ProfileMemoryItem,
+    existing_memories: list[
+        dict[str, Any]
+    ],
+) -> dict[str, Any]:
+    """
+    Classify one imported item without allowing the model to rewrite it.
+
+    The profile engine and MemoryReviewEngine host-validate the returned
+    relation before any pending suggestion is created.
+    """
+
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=(
+            build_profile_relation_messages(
+                item=item,
+                existing_memories=(
+                    existing_memories
+                ),
+            )
+        ),
+        format="json",
+        think=False,
+        options={
+            "temperature": 0.0,
+            "num_ctx": 4096,
+        },
+    )
+    content = (
+        response.message.content
+        or ""
+    ).strip()
+
+    return parse_profile_relation(
+        content
+    )
+
+
+def print_profile_preview(
+    *,
+    profile: ProfileDocument,
+    engine: ProfileImportEngine,
+) -> None:
+    results = engine.preview(
+        profile
+    )
+
+    print(
+        f"\nProfile preview: {profile.profile_name}"
+    )
+    print(
+        f"  path: {profile.path}"
+    )
+    print(
+        f"  SHA-256: {profile.sha256}"
+    )
+    print(
+        f"  schema version: {profile.schema_version}"
+    )
+    print(
+        f"  items: {len(profile.items)}"
+    )
+
+    if profile.description:
+        print(
+            f"  description: {profile.description}"
+        )
+
+    print(
+        "\nNo memories were changed."
+    )
+
+    for result in results:
+        relation_note = ""
+
+        if result.related_memory_id is not None:
+            relation_note = (
+                f"; related memory "
+                f"#{result.related_memory_id}"
+            )
+
+        print(
+            f"\n  {result.index}. "
+            f"[{result.category} | {result.status}"
+            f"{relation_note}]"
+        )
+        print(
+            f"     {result.content}"
+        )
+
+        if result.detail:
+            print(
+                f"     note: {result.detail}"
+            )
+
+    print(
+        "\nRun /import-profile <file> to stage included items. "
+        "Staging still requires individual /approve-memory commands."
+    )
+
+
+def print_profile_import_report(
+    report: ProfileImportReport,
+) -> None:
+    print(
+        f"\nProfile staged: {report.profile_name}"
+    )
+    print(
+        f"  profile fingerprint: {report.profile_hash[:12]}"
+    )
+    print(
+        f"  total items: {report.total_items}"
+    )
+    print(
+        f"  included items: {report.included_items}"
+    )
+    print(
+        f"  pending suggestions created: {report.staged}"
+    )
+    print(
+        f"  duplicates or already pending: {report.duplicates}"
+    )
+    print(
+        f"  blocked by safety checks: {report.blocked}"
+    )
+    print(
+        f"  excluded or otherwise skipped: {report.skipped}"
+    )
+
+    for result in report.results:
+        extra = ""
+
+        if result.suggestion_id is not None:
+            extra += (
+                f"; suggestion "
+                f"#{result.suggestion_id}"
+            )
+
+        if result.related_memory_id is not None:
+            extra += (
+                f"; related memory "
+                f"#{result.related_memory_id}"
+            )
+
+        print(
+            f"\n  {result.index}. "
+            f"[{result.category} | {result.status}{extra}]"
+        )
+        print(
+            f"     {result.content}"
+        )
+
+        if result.detail:
+            print(
+                f"     note: {result.detail}"
+            )
+
+    if report.staged:
+        print(
+            "\nReview with /memory-suggestions and approve or reject each item."
+        )
+
+    print(
+        "No confirmed memory was written by the import command."
+    )
+
+
+def handle_profile_preview(
+    user_input: str,
+    memory_store: MemoryStore,
+) -> None:
+    """Parse and execute /preview-profile."""
+
+    _, _, raw_path = user_input.partition(
+        " "
+    )
+    raw_path = raw_path.strip()
+
+    if not raw_path:
+        print(
+            "Elise: Usage: "
+            "/preview-profile <JSON file>"
+        )
+        return
+
+    try:
+        profile = load_profile(
+            resolve_profile_path(
+                raw_path
+            )
+        )
+        engine = ProfileImportEngine(
+            memory_store=(
+                memory_store
+            )
+        )
+        print_profile_preview(
+            profile=profile,
+            engine=engine,
+        )
+    except (
+        FileNotFoundError,
+        ValueError,
+        OSError,
+    ) as error:
+        print(
+            f"Elise: Profile preview failed: {error}"
+        )
+
+
 def handle_profile_import(
     user_input: str,
     memory_store: MemoryStore,
 ) -> None:
-    """Parse and execute /import-profile."""
+    """Validate and stage a JSON profile for explicit review."""
 
-    _, _, raw_path = user_input.partition(" ")
+    _, _, raw_path = user_input.partition(
+        " "
+    )
     raw_path = raw_path.strip()
 
     if not raw_path:
@@ -3679,29 +3927,35 @@ def handle_profile_import(
         )
         return
 
-    profile_path = Path(raw_path)
-
-    if not profile_path.is_absolute():
-        profile_path = BASE_DIRECTORY / profile_path
-
     try:
-        added, skipped = memory_store.import_profile(
-            profile_path
+        profile = load_profile(
+            resolve_profile_path(
+                raw_path
+            )
         )
-
-        print(
-            f"Elise: Profile imported. "
-            f"Added {added}; "
-            f"skipped {skipped} duplicates."
+        engine = ProfileImportEngine(
+            memory_store=(
+                memory_store
+            ),
+            classify_relation=(
+                classify_profile_memory
+            ),
         )
-
+        report = engine.stage(
+            profile
+        )
+        print_profile_import_report(
+            report
+        )
     except (
         FileNotFoundError,
         ValueError,
         OSError,
+        ConnectionError,
+        ollama.ResponseError,
     ) as error:
         print(
-            f"Elise: Import failed: {error}"
+            f"Elise: Profile import failed: {error}"
         )
 
 
@@ -8611,7 +8865,7 @@ def main() -> int:
     history: list[dict[str, Any]] = []
 
     print("=" * 55)
-    print("Elise 1.1.0-dev4.2")
+    print("Elise 1.1.0-dev5.1")
     print(f"Local model: {MODEL_NAME}")
     print("Model runtime: Ollama")
     print(
@@ -9220,8 +9474,23 @@ def main() -> int:
             )
             continue
 
-        if lowered_input.startswith(
-            "/import-profile"
+        if (
+            lowered_input == "/preview-profile"
+            or lowered_input.startswith(
+                "/preview-profile "
+            )
+        ):
+            handle_profile_preview(
+                user_input=user_input,
+                memory_store=memory_store,
+            )
+            continue
+
+        if (
+            lowered_input == "/import-profile"
+            or lowered_input.startswith(
+                "/import-profile "
+            )
         ):
             handle_profile_import(
                 user_input=user_input,
