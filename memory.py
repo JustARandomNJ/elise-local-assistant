@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
 import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 
 
 ALLOWED_CATEGORIES = {
@@ -169,12 +170,30 @@ class MemoryStore:
         self._initialize_database()
         self._migrate_existing_database()
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(
+        self,
+    ) -> Iterator[
+        sqlite3.Connection
+    ]:
+        """
+        Open one transactional connection and always close it.
+
+        sqlite3.Connection's context manager commits or rolls back but does
+        not close the handle. Explicit closure prevents temporary databases
+        from remaining locked on Windows.
+        """
+
         connection = sqlite3.connect(
             self.db_path
         )
         connection.row_factory = sqlite3.Row
-        return connection
+
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
 
     def _initialize_database(self) -> None:
         with self._connect() as connection:
