@@ -22,12 +22,20 @@ from internet import (
 from document_search import DocumentStore, SearchResult
 from memory import ALLOWED_CATEGORIES, MemoryStore
 from tools import ToolManager
+from workflow import (
+    WorkflowNotFoundError,
+    WorkflowStatus,
+    WorkflowStore,
+    WorkflowTransitionError,
+    WorkflowValidationError,
+)
 
 
 BASE_DIRECTORY = Path(__file__).resolve().parent
 MEMORY_DATABASE = BASE_DIRECTORY / "data" / "elise.db"
 TOOL_AUDIT_DATABASE = BASE_DIRECTORY / "data" / "tool_audit.db"
 INTERNET_SETTINGS = BASE_DIRECTORY / "data" / "internet_settings.json"
+WORKFLOW_DATABASE = BASE_DIRECTORY / "data" / "workflows.db"
 DOCUMENTS_DIRECTORY = BASE_DIRECTORY / "documents"
 
 MODEL_NAME = "qwen3.5:4b"
@@ -37,7 +45,7 @@ MEMORY_RESULTS_PER_QUERY = 6
 
 
 CURRENT_PROJECT_STATE = """
-Elise version: 1.0.8
+Elise version: 1.1.0-dev1
 
 Completed and currently working:
 - Ollama is installed on Windows.
@@ -192,6 +200,16 @@ Completed and currently working:
   facts from that source, and pass meaningful keyword-overlap validation.
 - Unsupported bullets are regenerated once and then dropped individually;
   one weak bullet can no longer force a full-answer fallback.
+- A persistent workflow state engine is available in data/workflows.db.
+- Workflow and step states use validated enums and reject illegal transitions.
+- Workflow plans, confirmation pauses, failures, cancellations, and events
+  persist across restarts without storing full sensitive step content.
+- The first deterministic workflow template records an eight-step
+  read-summarize-preview-confirm-write-reindex plan.
+- Workflow inspection, creation, resume, and cancellation commands are
+  available in the terminal.
+- Milestone 1 records and controls workflow state; automatic step execution
+  will be added in Milestone 2.
 
 Not yet implemented:
 - Multiple tool calls within one user turn.
@@ -839,6 +857,23 @@ def print_help() -> None:
         "  /create-dir <root> <path>\n"
         "      Preview and create one directory after confirmation.\n"
         "\n"
+        "  /new-workflow <source_path> <destination_path>\n"
+        "      Create a persistent read-summarize-write workflow plan.\n"
+        "      Example: /new-workflow documents/project_notes.md "
+"documents/next_steps.md\n"
+        "\n"
+        "  /workflows [limit]\n"
+        "      Show recent persistent workflows.\n"
+        "\n"
+        "  /workflow <id>\n"
+        "      Show one workflow and all of its step states.\n"
+        "\n"
+        "  /resume-workflow <id>\n"
+        "      Start a pending workflow or resume a confirmation pause.\n"
+        "\n"
+        "  /cancel-workflow <id>\n"
+        "      Cancel a non-terminal workflow and skip unfinished steps.\n"
+        "\n"
         "  /project-state\n"
         "      Display Elise's authoritative implementation state.\n"
         "\n"
@@ -850,6 +885,428 @@ def print_help() -> None:
         "\n"
         "  /exit\n"
         "      Close Elise.\n"
+    )
+
+
+
+def _parse_positive_integer(
+    value: str,
+    *,
+    label: str,
+) -> int:
+    try:
+        parsed = int(
+            value.strip()
+        )
+    except ValueError as error:
+        raise ValueError(
+            f"{label} must be a positive integer."
+        ) from error
+
+    if parsed <= 0:
+        raise ValueError(
+            f"{label} must be a positive integer."
+        )
+
+    return parsed
+
+
+def _workflow_current_step_text(
+    workflow: Any,
+) -> str:
+    if workflow.current_step is None:
+        return "-"
+
+    return str(
+        workflow.current_step
+    )
+
+
+def print_workflows(
+    workflow_store: WorkflowStore,
+    limit: int = 20,
+) -> None:
+    workflows = workflow_store.list_recent(
+        limit
+    )
+
+    if not workflows:
+        print(
+            "Elise: No persistent workflows are saved."
+        )
+        return
+
+    print(
+        f"\nNewest {len(workflows)} workflow(s):"
+    )
+
+    for workflow in workflows:
+        request_preview = (
+            workflow.original_request
+            if len(
+                workflow.original_request
+            )
+            <= 90
+            else (
+                workflow.original_request[
+                    :87
+                ]
+                + "..."
+            )
+        )
+        print(
+            f"\n  #{workflow.id} "
+            f"[{workflow.status.value}] "
+            f"{workflow.workflow_type}"
+        )
+        print(
+            "    current step: "
+            + _workflow_current_step_text(
+                workflow
+            )
+            + f" / {len(workflow.steps)}"
+        )
+        print(
+            f"    updated: {workflow.updated_at}"
+        )
+        print(
+            f"    request: {request_preview}"
+        )
+
+
+def print_workflow(
+    workflow_store: WorkflowStore,
+    workflow_id: int,
+) -> None:
+    try:
+        workflow = workflow_store.get_workflow(
+            workflow_id
+        )
+    except WorkflowNotFoundError as error:
+        print(
+            f"Elise: {error}"
+        )
+        return
+
+    print(
+        f"\nWorkflow #{workflow.id}"
+    )
+    print(
+        f"  type: {workflow.workflow_type}"
+    )
+    print(
+        f"  status: {workflow.status.value}"
+    )
+    print(
+        "  current step: "
+        + _workflow_current_step_text(
+            workflow
+        )
+    )
+    print(
+        f"  created: {workflow.created_at}"
+    )
+    print(
+        f"  updated: {workflow.updated_at}"
+    )
+
+    if workflow.completed_at:
+        print(
+            f"  completed: {workflow.completed_at}"
+        )
+
+    if workflow.error:
+        print(
+            f"  error: {workflow.error}"
+        )
+
+    print(
+        f"  request: {workflow.original_request}"
+    )
+    print(
+        "\n  Steps:"
+    )
+
+    for step in workflow.steps:
+        confirmation = (
+            " [confirmation]"
+            if step.requires_confirmation
+            else ""
+        )
+        pointer = (
+            "->"
+            if workflow.current_step
+            == step.step_number
+            else "  "
+        )
+        print(
+            f"  {pointer} {step.step_number}. "
+            f"[{step.status.value}] "
+            f"{step.display_name}"
+            f"{confirmation}"
+        )
+
+        if step.result_summary:
+            print(
+                f"       result: {step.result_summary}"
+            )
+
+        if step.error:
+            print(
+                f"       error: {step.error}"
+            )
+
+
+def record_workflow_audit(
+    *,
+    audit_log: ToolAuditLog,
+    request_text: str,
+    action: str,
+    arguments: dict[str, Any],
+    success: bool,
+    summary: str,
+    error: str | None = None,
+) -> int:
+    return audit_log.record(
+        source="workflow_command",
+        request_text=request_text,
+        tool_name=action,
+        arguments=arguments,
+        policy={
+            "access_mode": (
+                "workflow_state"
+            ),
+            "risk_level": "low",
+            "permission_mode": (
+                "explicit_command"
+            ),
+            "requires_confirmation": (
+                False
+            ),
+        },
+        approved=True,
+        result={
+            "success": success,
+            "tool": action,
+            "error": error,
+        },
+        result_summary=summary,
+    )
+
+
+def handle_new_workflow_command(
+    user_input: str,
+    workflow_store: WorkflowStore,
+    audit_log: ToolAuditLog,
+) -> None:
+    try:
+        tokens = shlex.split(
+            user_input
+        )
+    except ValueError as error:
+        print(
+            f"Elise: Could not parse command: {error}"
+        )
+        return
+
+    if len(
+        tokens
+    ) != 3:
+        print(
+            "Elise: Usage: /new-workflow "
+            "<source_path> <destination_path>"
+        )
+        return
+
+    source_path = tokens[
+        1
+    ]
+    destination_path = tokens[
+        2
+    ]
+
+    try:
+        workflow = (
+            workflow_store
+            .create_read_summarize_write_workflow(
+                source_path=source_path,
+                destination_path=(
+                    destination_path
+                ),
+            )
+        )
+    except WorkflowValidationError as error:
+        summary = (
+            f"failed: {error}"
+        )
+        record_workflow_audit(
+            audit_log=audit_log,
+            request_text=user_input,
+            action="workflow_create",
+            arguments={
+                "source_path": source_path,
+                "destination_path": (
+                    destination_path
+                ),
+                "workflow_type": (
+                    "read_summarize_write"
+                ),
+            },
+            success=False,
+            summary=summary,
+            error=str(
+                error
+            ),
+        )
+        print(
+            f"Elise: {error}"
+        )
+        return
+
+    record_workflow_audit(
+        audit_log=audit_log,
+        request_text=user_input,
+        action="workflow_create",
+        arguments={
+            "workflow_id": workflow.id,
+            "source_path": source_path,
+            "destination_path": (
+                destination_path
+            ),
+            "workflow_type": (
+                workflow.workflow_type
+            ),
+        },
+        success=True,
+        summary=(
+            f"success: created workflow "
+            f"{workflow.id} with "
+            f"{len(workflow.steps)} steps"
+        ),
+    )
+    print(
+        f"Elise: Created workflow #{workflow.id} "
+        f"with {len(workflow.steps)} steps."
+    )
+    print(
+        "Elise: Milestone 1 records and validates "
+        "workflow state; automatic step execution "
+        "arrives in Milestone 2."
+    )
+    print_workflow(
+        workflow_store,
+        workflow.id,
+    )
+
+
+def handle_resume_workflow_command(
+    user_input: str,
+    workflow_store: WorkflowStore,
+    audit_log: ToolAuditLog,
+) -> None:
+    _, _, raw_id = user_input.partition(
+        " "
+    )
+
+    try:
+        workflow_id = _parse_positive_integer(
+            raw_id,
+            label="Workflow ID",
+        )
+        workflow = workflow_store.resume_workflow(
+            workflow_id
+        )
+    except (
+        ValueError,
+        WorkflowNotFoundError,
+        WorkflowTransitionError,
+    ) as error:
+        print(
+            f"Elise: {error}"
+        )
+        return
+
+    record_workflow_audit(
+        audit_log=audit_log,
+        request_text=user_input,
+        action="workflow_resume",
+        arguments={
+            "workflow_id": workflow_id,
+        },
+        success=True,
+        summary=(
+            f"success: workflow {workflow_id} "
+            f"is {workflow.status.value}"
+        ),
+    )
+    print(
+        f"Elise: Workflow #{workflow_id} is now "
+        f"{workflow.status.value}."
+    )
+
+    if (
+        workflow.status
+        is WorkflowStatus.RUNNING
+    ):
+        print(
+            "Elise: Automatic execution is not enabled "
+            "until Milestone 2."
+        )
+
+    print_workflow(
+        workflow_store,
+        workflow_id,
+    )
+
+
+def handle_cancel_workflow_command(
+    user_input: str,
+    workflow_store: WorkflowStore,
+    audit_log: ToolAuditLog,
+) -> None:
+    _, _, raw_id = user_input.partition(
+        " "
+    )
+
+    try:
+        workflow_id = _parse_positive_integer(
+            raw_id,
+            label="Workflow ID",
+        )
+        workflow = (
+            workflow_store.cancel_workflow(
+                workflow_id
+            )
+        )
+    except (
+        ValueError,
+        WorkflowNotFoundError,
+        WorkflowTransitionError,
+    ) as error:
+        print(
+            f"Elise: {error}"
+        )
+        return
+
+    record_workflow_audit(
+        audit_log=audit_log,
+        request_text=user_input,
+        action="workflow_cancel",
+        arguments={
+            "workflow_id": workflow_id,
+        },
+        success=True,
+        summary=(
+            f"success: workflow {workflow_id} cancelled"
+        ),
+    )
+    print(
+        f"Elise: Workflow #{workflow_id} was cancelled. "
+        "Completed actions, if any, were not undone."
+    )
+    print_workflow(
+        workflow_store,
+        workflow_id,
     )
 
 
@@ -7297,6 +7754,10 @@ def main() -> int:
         TOOL_AUDIT_DATABASE
     )
 
+    workflow_store = WorkflowStore(
+        WORKFLOW_DATABASE
+    )
+
     file_count, chunk_count = (
         document_store.reindex()
     )
@@ -7304,7 +7765,7 @@ def main() -> int:
     history: list[dict[str, Any]] = []
 
     print("=" * 55)
-    print("Elise 1.0.8")
+    print("Elise 1.1.0-dev1")
     print(f"Local model: {MODEL_NAME}")
     print("Model runtime: Ollama")
     print(
@@ -7326,6 +7787,10 @@ def main() -> int:
     print(
         f"Tool audit log: {TOOL_AUDIT_DATABASE} "
         f"({audit_log.count()} entries)"
+    )
+    print(
+        f"Workflow state: {WORKFLOW_DATABASE} "
+        f"({workflow_store.count()} workflows)"
     )
     print(
         "Tool permission framework: enabled"
@@ -7444,6 +7909,110 @@ def main() -> int:
             print_tool_audit_log(
                 audit_log,
                 audit_limit,
+            )
+            continue
+
+        if (
+            lowered_input == "/workflows"
+            or lowered_input.startswith(
+                "/workflows "
+            )
+        ):
+            _, _, raw_limit = (
+                user_input.partition(
+                    " "
+                )
+            )
+
+            if raw_limit.strip():
+                try:
+                    workflow_limit = (
+                        _parse_positive_integer(
+                            raw_limit,
+                            label="Limit",
+                        )
+                    )
+                except ValueError as error:
+                    print(
+                        f"Elise: {error}"
+                    )
+                    continue
+            else:
+                workflow_limit = 20
+
+            print_workflows(
+                workflow_store,
+                workflow_limit,
+            )
+            continue
+
+        if (
+            lowered_input == "/workflow"
+            or lowered_input.startswith(
+                "/workflow "
+            )
+        ):
+            _, _, raw_id = (
+                user_input.partition(
+                    " "
+                )
+            )
+
+            try:
+                workflow_id = (
+                    _parse_positive_integer(
+                        raw_id,
+                        label="Workflow ID",
+                    )
+                )
+            except ValueError as error:
+                print(
+                    f"Elise: {error}"
+                )
+                continue
+
+            print_workflow(
+                workflow_store,
+                workflow_id,
+            )
+            continue
+
+        if (
+            lowered_input == "/new-workflow"
+            or lowered_input.startswith(
+                "/new-workflow "
+            )
+        ):
+            handle_new_workflow_command(
+                user_input,
+                workflow_store,
+                audit_log,
+            )
+            continue
+
+        if (
+            lowered_input == "/resume-workflow"
+            or lowered_input.startswith(
+                "/resume-workflow "
+            )
+        ):
+            handle_resume_workflow_command(
+                user_input,
+                workflow_store,
+                audit_log,
+            )
+            continue
+
+        if (
+            lowered_input == "/cancel-workflow"
+            or lowered_input.startswith(
+                "/cancel-workflow "
+            )
+        ):
+            handle_cancel_workflow_command(
+                user_input,
+                workflow_store,
+                audit_log,
             )
             continue
 
