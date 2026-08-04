@@ -21,7 +21,7 @@ from typing import Any, Callable
 import zlib
 
 
-SUITE_VERSION = "1.0.1"
+SUITE_VERSION = "1.1.1"
 DEFAULT_GROUPS = {
     "structure",
     "memory",
@@ -30,6 +30,7 @@ DEFAULT_GROUPS = {
     "audit",
     "internet",
     "app",
+    "workflow",
 }
 OPTIONAL_GROUPS = {
     "live-internet",
@@ -42,6 +43,7 @@ REQUIRED_PROJECT_FILES = {
     "tools.py",
     "audit.py",
     "internet.py",
+    "workflow.py",
 }
 
 
@@ -209,6 +211,100 @@ def import_fresh(
     return importlib.import_module(
         module_name
     )
+
+
+def import_project_module(
+    project_root: Path,
+    module_name: str,
+):
+    """
+    Import one project module from its exact file path.
+
+    This prevents unrelated installed packages or stale modules with common
+    names such as ``app`` from satisfying a regression import accidentally.
+    """
+
+    module_path = (
+        project_root
+        / f"{module_name}.py"
+    ).resolve()
+
+    require(
+        module_path.is_file(),
+        f"Project module does not exist: {module_path}",
+    )
+
+    unique_name = (
+        "_elise_regression_"
+        + module_name
+        + "_"
+        + str(
+            abs(
+                hash(
+                    str(
+                        module_path
+                    )
+                )
+            )
+        )
+    )
+    importlib.invalidate_caches()
+
+    if unique_name in sys.modules:
+        del sys.modules[
+            unique_name
+        ]
+
+    specification = (
+        importlib.util.spec_from_file_location(
+            unique_name,
+            module_path,
+        )
+    )
+    require(
+        specification is not None
+        and specification.loader is not None,
+        f"Could not build an import specification for {module_path}",
+    )
+
+    module = (
+        importlib.util.module_from_spec(
+            specification
+        )
+    )
+    sys.modules[
+        unique_name
+    ] = module
+
+    try:
+        specification.loader.exec_module(
+            module
+        )
+    except Exception:
+        sys.modules.pop(
+            unique_name,
+            None,
+        )
+        raise
+
+    loaded_path = Path(
+        str(
+            getattr(
+                module,
+                "__file__",
+                "",
+            )
+        )
+    ).resolve()
+    require(
+        loaded_path == module_path,
+        (
+            "Regression imported the wrong project module. "
+            f"Expected {module_path}; loaded {loaded_path}."
+        ),
+    )
+
+    return module
 
 
 def row_value(
@@ -1598,11 +1694,451 @@ def check_internet_manager(
     )
 
 
+
+def check_workflow_store(
+    project_root: Path,
+) -> str:
+    workflow_module = import_fresh(
+        "workflow"
+    )
+    WorkflowStore = (
+        workflow_module.WorkflowStore
+    )
+    WorkflowStatus = (
+        workflow_module.WorkflowStatus
+    )
+    StepStatus = (
+        workflow_module.StepStatus
+    )
+    WorkflowTransitionError = (
+        workflow_module.WorkflowTransitionError
+    )
+    WorkflowValidationError = (
+        workflow_module.WorkflowValidationError
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="elise-regression-workflow-",
+        ignore_cleanup_errors=True,
+    ) as temporary_directory:
+        database = (
+            Path(
+                temporary_directory
+            )
+            / "workflows.db"
+        )
+        store = WorkflowStore(
+            database
+        )
+
+        workflow = (
+            store.create_read_summarize_write_workflow(
+                source_path=(
+                    "documents/project_notes.md"
+                ),
+                destination_path=(
+                    "documents/next_steps.md"
+                ),
+            )
+        )
+        require(
+            workflow.status
+            is WorkflowStatus.PENDING,
+            "New workflow did not start pending.",
+        )
+        require(
+            len(
+                workflow.steps
+            )
+            == 8,
+            "Read-summarize-write template did not contain eight steps.",
+        )
+        require(
+            [
+                step.step_number
+                for step in workflow.steps
+            ]
+            == list(
+                range(
+                    1,
+                    9,
+                )
+            ),
+            "Workflow step order is invalid.",
+        )
+        require(
+            workflow.steps[
+                4
+            ].requires_confirmation
+            is True,
+            "Confirmation step lost its confirmation flag.",
+        )
+
+        try:
+            store.create_read_summarize_write_workflow(
+                source_path="../secret.txt",
+                destination_path=(
+                    "documents/out.md"
+                ),
+            )
+        except WorkflowValidationError:
+            pass
+        else:
+            raise AssertionError(
+                "Unsafe workflow path was accepted."
+            )
+
+        started = store.start_workflow(
+            workflow.id
+        )
+        require(
+            started.status
+            is WorkflowStatus.RUNNING,
+            "Pending workflow did not start.",
+        )
+        require(
+            started.current_step == 1,
+            "Started workflow did not select step one.",
+        )
+        require(
+            started.steps[
+                0
+            ].status
+            is StepStatus.RUNNING,
+            "First step did not become running.",
+        )
+
+        try:
+            store.start_workflow(
+                workflow.id
+            )
+        except WorkflowTransitionError:
+            pass
+        else:
+            raise AssertionError(
+                "Starting an already active workflow was accepted."
+            )
+
+        try:
+            store.begin_step(
+                workflow.id,
+                3,
+            )
+        except WorkflowTransitionError:
+            pass
+        else:
+            raise AssertionError(
+                "Out-of-order step execution was accepted."
+            )
+
+        for step_number in (
+            1,
+            2,
+            3,
+            4,
+        ):
+            current = store.get_workflow(
+                workflow.id
+            )
+
+            if (
+                current.steps[
+                    step_number
+                    - 1
+                ].status
+                is StepStatus.PENDING
+            ):
+                store.begin_step(
+                    workflow.id,
+                    step_number,
+                )
+
+            store.complete_step(
+                workflow.id,
+                step_number,
+                result_summary=(
+                    f"Regression completed step {step_number}."
+                ),
+            )
+
+        store.begin_step(
+            workflow.id,
+            5,
+        )
+        waiting = (
+            store.wait_for_confirmation(
+                workflow.id,
+                5,
+            )
+        )
+        require(
+            waiting.status
+            is WorkflowStatus.WAITING_FOR_CONFIRMATION,
+            "Workflow did not pause for confirmation.",
+        )
+        require(
+            waiting.steps[
+                4
+            ].status
+            is StepStatus.RUNNING,
+            "Confirmation pause changed the step out of running state.",
+        )
+
+        reopened = WorkflowStore(
+            database
+        )
+        persisted = reopened.get_workflow(
+            workflow.id
+        )
+        require(
+            persisted.status
+            is WorkflowStatus.WAITING_FOR_CONFIRMATION,
+            "Confirmation pause did not persist after reopening.",
+        )
+        resumed = reopened.resume_workflow(
+            workflow.id
+        )
+        require(
+            resumed.status
+            is WorkflowStatus.RUNNING,
+            "Confirmation-waiting workflow did not resume.",
+        )
+        reopened.complete_step(
+            workflow.id,
+            5,
+            result_summary=(
+                "User confirmation recorded."
+            ),
+        )
+        reopened.begin_step(
+            workflow.id,
+            6,
+        )
+        failed = reopened.fail_step(
+            workflow.id,
+            6,
+            error=(
+                "Regression write failure."
+            ),
+        )
+        require(
+            failed.status
+            is WorkflowStatus.FAILED,
+            "Failed step did not fail the workflow.",
+        )
+        require(
+            failed.steps[
+                5
+            ].status
+            is StepStatus.FAILED,
+            "Active failed step was not marked failed.",
+        )
+        require(
+            all(
+                step.status
+                is StepStatus.SKIPPED
+                for step in failed.steps[
+                    6:
+                ]
+            ),
+            "Dependent steps were not skipped after failure.",
+        )
+
+        try:
+            reopened.resume_workflow(
+                workflow.id
+            )
+        except WorkflowTransitionError:
+            pass
+        else:
+            raise AssertionError(
+                "Failed workflow was allowed to resume."
+            )
+
+        cancelled_target = (
+            reopened.create_read_summarize_write_workflow(
+                source_path=(
+                    "documents/another.md"
+                ),
+                destination_path=(
+                    "documents/another-summary.md"
+                ),
+            )
+        )
+        cancelled = (
+            reopened.cancel_workflow(
+                cancelled_target.id
+            )
+        )
+        require(
+            cancelled.status
+            is WorkflowStatus.CANCELLED,
+            "Pending workflow did not cancel.",
+        )
+        require(
+            all(
+                step.status
+                is StepStatus.SKIPPED
+                for step in cancelled.steps
+            ),
+            "Cancelled workflow left unfinished steps active.",
+        )
+
+        completed_target = (
+            reopened.create_workflow(
+                original_request=(
+                    "Complete two deterministic steps."
+                ),
+                workflow_type=(
+                    "regression_complete"
+                ),
+                steps=[
+                    {
+                        "action_name": "one",
+                        "display_name": "First",
+                    },
+                    {
+                        "action_name": "two",
+                        "display_name": "Second",
+                    },
+                ],
+            )
+        )
+        reopened.start_workflow(
+            completed_target.id
+        )
+        reopened.complete_step(
+            completed_target.id,
+            1,
+        )
+        reopened.begin_step(
+            completed_target.id,
+            2,
+        )
+        completed = reopened.complete_step(
+            completed_target.id,
+            2,
+        )
+        require(
+            completed.status
+            is WorkflowStatus.COMPLETED,
+            "All-completed workflow did not become completed.",
+        )
+        require(
+            completed.current_step
+            is None,
+            "Completed workflow retained a current step.",
+        )
+
+        secret = (
+            "REGRESSION_SECRET_WORKFLOW_CONTENT"
+        )
+        redacted_target = (
+            reopened.create_workflow(
+                original_request=(
+                    "Store a safely redacted argument."
+                ),
+                workflow_type=(
+                    "regression_redaction"
+                ),
+                steps=[
+                    {
+                        "action_name": "redact",
+                        "display_name": (
+                            "Redact sensitive content"
+                        ),
+                        "arguments": {
+                            "content": secret,
+                            "safe_path": (
+                                "documents/safe.md"
+                            ),
+                        },
+                    }
+                ],
+            )
+        )
+        redacted_arguments = (
+            redacted_target.steps[
+                0
+            ].arguments
+        )
+        require(
+            secret
+            not in json.dumps(
+                redacted_arguments,
+                sort_keys=True,
+            ),
+            "Sensitive workflow content was stored directly.",
+        )
+        require(
+            redacted_arguments[
+                "content"
+            ][
+                "redacted"
+            ]
+            is True,
+            "Sensitive workflow argument lacks a redaction marker.",
+        )
+        require(
+            len(
+                redacted_arguments[
+                    "content"
+                ][
+                    "sha256"
+                ]
+            )
+            == 64,
+            "Redacted workflow argument lacks a SHA-256 hash.",
+        )
+
+        events = reopened.list_events(
+            workflow.id
+        )
+        require(
+            events,
+            "Workflow event history is empty.",
+        )
+        require(
+            any(
+                event.event_type
+                == "waiting_for_confirmation"
+                for event in events
+            ),
+            "Confirmation pause was not recorded as an event.",
+        )
+        require(
+            any(
+                event.event_type
+                == "failed"
+                for event in events
+            ),
+            "Workflow failure was not recorded as an event.",
+        )
+        require(
+            reopened.count()
+            >= 4,
+            "Workflow count did not persist created records.",
+        )
+        require(
+            reopened.list_recent(
+                2
+            ),
+            "Recent workflow listing returned no records.",
+        )
+
+    return (
+        "Creation, ordering, legal transitions, confirmation persistence, "
+        "failure propagation, cancellation, completion, redaction, and "
+        "event history passed"
+    )
+
+
 def check_app_pure_functions(
     project_root: Path,
 ) -> str:
-    app_module = import_fresh(
-        "app"
+    app_module = import_project_module(
+        project_root,
+        "app",
     )
 
     require(
@@ -1798,8 +2334,9 @@ def check_live_internet(
 def check_live_model(
     project_root: Path,
 ) -> str:
-    app_module = import_fresh(
-        "app"
+    app_module = import_project_module(
+        project_root,
+        "app",
     )
     ollama_module = import_fresh(
         "ollama"
@@ -1916,7 +2453,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Run selected groups only. Repeat the option or use commas. "
             "Groups: structure, memory, documents, tools, audit, internet, "
-            "app, live-internet, live-model."
+            "workflow, app, live-internet, live-model."
         ),
     )
     parser.add_argument(
@@ -2087,6 +2624,13 @@ def main() -> int:
         "internet",
         "offline-safe settings, URL, and compression",
         lambda: check_internet_manager(
+            project_root
+        ),
+    )
+    runner.run(
+        "workflow",
+        "persistent workflow state machine",
+        lambda: check_workflow_store(
             project_root
         ),
     )
