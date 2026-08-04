@@ -21,10 +21,11 @@ from typing import Any, Callable
 import zlib
 
 
-SUITE_VERSION = "1.3.0"
+SUITE_VERSION = "1.4.2"
 DEFAULT_GROUPS = {
     "structure",
     "memory",
+    "memory-review",
     "documents",
     "tools",
     "audit",
@@ -41,6 +42,7 @@ OPTIONAL_GROUPS = {
 REQUIRED_PROJECT_FILES = {
     "app.py",
     "memory.py",
+    "memory_review.py",
     "document_search.py",
     "tools.py",
     "audit.py",
@@ -732,6 +734,598 @@ def check_memory_store(
     return (
         "Add, duplicate rejection, search, prompt, import, persistence, "
         "and deletion passed"
+    )
+
+
+def check_memory_review(
+    project_root: Path,
+) -> str:
+    memory_module = import_fresh(
+        "memory"
+    )
+    review_module = import_fresh(
+        "memory_review"
+    )
+    MemoryStore = (
+        memory_module.MemoryStore
+    )
+    MemoryReviewEngine = (
+        review_module.MemoryReviewEngine
+    )
+    MemoryReviewSettings = (
+        review_module.MemoryReviewSettings
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="elise-regression-memory-review-",
+        ignore_cleanup_errors=True,
+    ) as temporary_directory:
+        root = Path(
+            temporary_directory
+        )
+        database = (
+            root
+            / "data"
+            / "elise.db"
+        )
+        settings_path = (
+            root
+            / "data"
+            / "memory_review_settings.json"
+        )
+        store = MemoryStore(
+            database
+        )
+        settings = MemoryReviewSettings(
+            settings_path,
+            default_enabled=True,
+        )
+        require(
+            settings.is_enabled()
+            is True,
+            "Memory review did not default to enabled.",
+        )
+        settings.set_enabled(
+            False
+        )
+        require(
+            MemoryReviewSettings(
+                settings_path
+            ).is_enabled()
+            is False,
+            "Disabled memory review did not persist.",
+        )
+        settings.set_enabled(
+            True
+        )
+
+        extraction_calls: list[
+            str
+        ] = []
+
+        def new_preference_extractor(
+            user_text: str,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> str:
+            extraction_calls.append(
+                user_text
+            )
+            return (
+                "```json\n"
+                + json.dumps(
+                    {
+                        "should_suggest": True,
+                        "content": (
+                            "User prefers concise, practical explanations."
+                        ),
+                        "category": "preference",
+                        "confidence": 0.96,
+                        "reason": (
+                            "This is a durable communication preference."
+                        ),
+                        "relation": "new",
+                        "related_memory_id": None,
+                    }
+                )
+                + "\n```"
+            )
+
+        engine = MemoryReviewEngine(
+            memory_store=store,
+            extract_candidate=(
+                new_preference_extractor
+            ),
+        )
+        require(
+            MemoryReviewEngine._normalize_candidate_content(
+                "the user prefers formal academic summaries"
+            )
+            == "User prefers formal academic summaries.",
+            "Candidate normalization duplicated the user subject.",
+        )
+        require(
+            MemoryReviewEngine._normalize_candidate_content(
+                "User the user prefers concise answers"
+            )
+            == "User prefers concise answers.",
+            "Malformed repeated user subject was not repaired.",
+        )
+        require(
+            review_module.is_likely_memory_declaration(
+                "I prefer answers with one concrete next step."
+            )
+            is True,
+            "Explicit preference declaration was not detected.",
+        )
+        require(
+            review_module.is_likely_memory_declaration(
+                "I want all project summaries to use a formal academic tone."
+            )
+            is True,
+            "Standing output preference was not detected.",
+        )
+        require(
+            review_module.is_likely_memory_declaration(
+                "I want you to create documents/summary.md."
+            )
+            is False,
+            "Explicit action request was misclassified as a memory declaration.",
+        )
+        raw_user_text = (
+            "I prefer concise, practical explanations. "
+            "RAW_PRIVATE_CONTEXT_MARKER"
+        )
+        outcome = engine.review(
+            raw_user_text
+        )
+        require(
+            outcome.status
+            == "suggested",
+            "Durable preference did not create a suggestion.",
+        )
+        require(
+            outcome.suggestion_id
+            is not None,
+            "Created suggestion has no ID.",
+        )
+        suggestion_id = int(
+            outcome.suggestion_id
+        )
+        suggestion = store.get_suggestion(
+            suggestion_id
+        )
+        require(
+            suggestion is not None,
+            "Pending suggestion could not be loaded.",
+        )
+        require(
+            row_value(
+                suggestion,
+                "status",
+            )
+            == "pending",
+            "New suggestion was not pending.",
+        )
+        require(
+            store.count_pending_suggestions()
+            == 1,
+            "Pending suggestion count is incorrect.",
+        )
+        require(
+            "RAW_PRIVATE_CONTEXT_MARKER".encode(
+                "utf-8"
+            )
+            not in database.read_bytes(),
+            "Memory database stored the complete raw review message.",
+        )
+
+        reopened = MemoryStore(
+            database
+        )
+        require(
+            reopened.count_pending_suggestions()
+            == 1,
+            "Pending suggestion did not persist after reopening.",
+        )
+        approval = (
+            reopened.approve_suggestion(
+                suggestion_id
+            )
+        )
+        require(
+            approval.get(
+                "success"
+            )
+            is True
+            and approval.get(
+                "action"
+            )
+            == "created",
+            "Approving a new suggestion did not create memory.",
+        )
+        created_memory_id = int(
+            approval[
+                "memory_id"
+            ]
+        )
+        created_memory = reopened.get(
+            created_memory_id
+        )
+        require(
+            created_memory is not None,
+            "Approved memory could not be loaded.",
+        )
+        require(
+            row_value(
+                created_memory,
+                "content",
+            )
+            == "User prefers concise, practical explanations.",
+            "Approved memory content changed.",
+        )
+        require(
+            row_value(
+                reopened.get_suggestion(
+                    suggestion_id
+                ),
+                "status",
+            )
+            == "approved",
+            "Approved suggestion status did not persist.",
+        )
+
+        duplicate_engine = MemoryReviewEngine(
+            memory_store=reopened,
+            extract_candidate=(
+                new_preference_extractor
+            ),
+        )
+        duplicate = duplicate_engine.review(
+            "I prefer concise and practical explanations."
+        )
+        require(
+            duplicate.status
+            == "duplicate",
+            "Existing equivalent memory was not detected as duplicate.",
+        )
+        require(
+            reopened.count_pending_suggestions()
+            == 0,
+            "Duplicate review created a pending suggestion.",
+        )
+
+        added_unrelated = reopened.add(
+            content=(
+                "User prefers project summaries to use a formal academic tone."
+            ),
+            category="preference",
+            confidence=1.0,
+            source="regression",
+        )
+        require(
+            added_unrelated is True,
+            "Could not create unrelated regression memory.",
+        )
+        unrelated_memory_id = max(
+            int(
+                row[
+                    "id"
+                ]
+            )
+            for row in reopened.list_all()
+            if str(
+                row[
+                    "content"
+                ]
+            )
+            == (
+                "User prefers project summaries to use a formal academic tone."
+            )
+        )
+
+        def false_duplicate_extractor(
+            user_text: str,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> dict[str, Any]:
+            return {
+                "should_suggest": True,
+                "content": (
+                    "User prefers code examples to include brief comments "
+                    "explaining safety checks."
+                ),
+                "category": "preference",
+                "confidence": 0.97,
+                "reason": (
+                    "This is a durable code-example preference."
+                ),
+                "relation": "duplicate",
+                "related_memory_id": (
+                    unrelated_memory_id
+                ),
+            }
+
+        false_duplicate_engine = MemoryReviewEngine(
+            memory_store=reopened,
+            extract_candidate=(
+                false_duplicate_extractor
+            ),
+        )
+        false_duplicate = (
+            false_duplicate_engine.review(
+                "I prefer code examples to include brief comments "
+                "explaining safety checks."
+            )
+        )
+        require(
+            false_duplicate.status
+            == "suggested"
+            and false_duplicate.relation
+            == "new",
+            "Unrelated model-declared duplicate suppressed a new suggestion.",
+        )
+        reopened.reject_suggestion(
+            int(
+                false_duplicate.suggestion_id
+            )
+        )
+
+        def no_candidate_extractor(
+            user_text: str,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> dict[str, Any]:
+            return {
+                "should_suggest": False,
+            }
+
+        fallback_engine = MemoryReviewEngine(
+            memory_store=reopened,
+            extract_candidate=(
+                no_candidate_extractor
+            ),
+        )
+        fallback_duplicate = (
+            fallback_engine.review(
+                "I want all project summaries to use a formal academic tone."
+            )
+        )
+        require(
+            fallback_duplicate.status
+            == "duplicate"
+            and fallback_duplicate.related_memory_id
+            == unrelated_memory_id,
+            "Explicit preference fallback did not report an existing duplicate.",
+        )
+
+        def conflict_extractor(
+            user_text: str,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> dict[str, Any]:
+            return {
+                "should_suggest": True,
+                "content": (
+                    "User prefers detailed, step-by-step explanations."
+                ),
+                "category": "preference",
+                "confidence": 0.94,
+                "reason": (
+                    "The user directly changed their explanation preference."
+                ),
+                "relation": "conflict",
+                "related_memory_id": (
+                    created_memory_id
+                ),
+            }
+
+        conflict_engine = MemoryReviewEngine(
+            memory_store=reopened,
+            extract_candidate=(
+                conflict_extractor
+            ),
+        )
+        conflict = conflict_engine.review(
+            "I prefer detailed, step-by-step explanations."
+        )
+        require(
+            conflict.status
+            == "suggested"
+            and conflict.relation
+            == "conflict",
+            "Conflict candidate was not presented for approval.",
+        )
+        conflict_id = int(
+            conflict.suggestion_id
+        )
+        require(
+            row_value(
+                reopened.get(
+                    created_memory_id
+                ),
+                "content",
+            )
+            == "User prefers concise, practical explanations.",
+            "Conflict changed memory before approval.",
+        )
+        conflict_approval = (
+            reopened.approve_suggestion(
+                conflict_id
+            )
+        )
+        require(
+            conflict_approval.get(
+                "action"
+            )
+            == "replaced"
+            and int(
+                conflict_approval[
+                    "memory_id"
+                ]
+            )
+            == created_memory_id,
+            "Conflict approval did not replace the related memory in place.",
+        )
+        require(
+            row_value(
+                reopened.get(
+                    created_memory_id
+                ),
+                "content",
+            )
+            == "User prefers detailed, step-by-step explanations.",
+            "Approved conflict did not update memory content.",
+        )
+
+        def goal_extractor(
+            user_text: str,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> dict[str, Any]:
+            return {
+                "should_suggest": True,
+                "content": (
+                    "User wants to finish the local assistant before hardware integration."
+                ),
+                "category": "goal",
+                "confidence": 0.95,
+                "reason": (
+                    "This is a durable project priority."
+                ),
+                "relation": "new",
+                "related_memory_id": None,
+            }
+
+        reject_engine = MemoryReviewEngine(
+            memory_store=reopened,
+            extract_candidate=(
+                goal_extractor
+            ),
+        )
+        rejected_outcome = reject_engine.review(
+            "I want to finish the local assistant before hardware integration."
+        )
+        require(
+            rejected_outcome.status
+            == "suggested",
+            "Durable goal did not create a suggestion.",
+        )
+        rejected_id = int(
+            rejected_outcome.suggestion_id
+        )
+        require(
+            reopened.reject_suggestion(
+                rejected_id
+            )
+            is True,
+            "Pending suggestion could not be rejected.",
+        )
+        require(
+            row_value(
+                reopened.get_suggestion(
+                    rejected_id
+                ),
+                "status",
+            )
+            == "rejected",
+            "Rejected suggestion status did not persist.",
+        )
+        require(
+            not any(
+                "finish the local assistant"
+                in row_value(
+                    row,
+                    "content",
+                )
+                for row in reopened.list_all()
+            ),
+            "Rejected suggestion was written to confirmed memory.",
+        )
+
+        sensitive_calls = 0
+
+        def should_not_run(
+            user_text: str,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> dict[str, Any]:
+            nonlocal sensitive_calls
+            sensitive_calls += 1
+            return {
+                "should_suggest": False,
+            }
+
+        filter_engine = MemoryReviewEngine(
+            memory_store=reopened,
+            extract_candidate=(
+                should_not_run
+            ),
+        )
+        sensitive = filter_engine.review(
+            "I was diagnosed with a medical condition."
+        )
+        transient = filter_engine.review(
+            "I am working from home today."
+        )
+        third_party = filter_engine.review(
+            "My friend is applying for a new job."
+        )
+        require(
+            sensitive.status
+            == "skipped"
+            and sensitive.detail
+            == "sensitive",
+            "Sensitive user information was not filtered before extraction.",
+        )
+        require(
+            transient.status
+            == "skipped"
+            and transient.detail
+            == "transient",
+            "Temporary user information was not filtered before extraction.",
+        )
+        require(
+            third_party.status
+            == "skipped"
+            and third_party.detail
+            == "third_party",
+            "Third-party information was not filtered before extraction.",
+        )
+        require(
+            sensitive_calls
+            == 0,
+            "Filtered messages were still sent to the extractor.",
+        )
+
+        require(
+            len(
+                reopened.list_suggestions(
+                    status=None,
+                    limit=20,
+                )
+            )
+            == 4,
+            "Unexpected total suggestion-history count.",
+        )
+
+        release_resources(
+            reopened,
+            store,
+        )
+        del reopened
+        del store
+
+    return (
+        "Conservative extraction, raw-message hashing, pending persistence, "
+        "approval, conflict replacement, rejection, duplicate detection, "
+        "sensitive/transient filtering, and settings persistence passed"
     )
 
 
@@ -2923,6 +3517,28 @@ def check_app_pure_functions(
         "Document-scoped query detection failed.",
     )
     require(
+        app_module.is_likely_memory_declaration(
+            "I now prefer detailed step-by-step explanations."
+        )
+        is True,
+        "App did not expose the deterministic preference route.",
+    )
+    acknowledgment = (
+        app_module.build_memory_declaration_acknowledgment(
+            "I want all project summaries to use a formal academic tone."
+        )
+    )
+    require(
+        "No files or settings were changed."
+        in acknowledgment,
+        "Preference acknowledgment did not deny unverified file changes.",
+    )
+    require(
+        "confirmation preview"
+        not in acknowledgment.lower(),
+        "Preference acknowledgment fabricated a confirmation preview.",
+    )
+    require(
         app_module.requires_forced_freshness_search(
             "What are the latest major updates to Python?"
         )
@@ -3226,8 +3842,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=[],
         help=(
             "Run selected groups only. Repeat the option or use commas. "
-            "Groups: structure, memory, documents, tools, audit, internet, "
-            "workflow, workflow-execution, workflow-templates, app, "
+            "Groups: structure, memory, memory-review, documents, tools, audit, "
+            "internet, workflow, workflow-execution, workflow-templates, app, "
             "live-internet, live-model."
         ),
     )
@@ -3371,6 +3987,13 @@ def main() -> int:
         "memory",
         "structured memory lifecycle",
         lambda: check_memory_store(
+            project_root
+        ),
+    )
+    runner.run(
+        "memory-review",
+        "approval-gated automatic memory suggestions",
+        lambda: check_memory_review(
             project_root
         ),
     )
