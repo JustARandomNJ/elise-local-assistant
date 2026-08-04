@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import getpass
 import hashlib
 import json
 import re
@@ -20,7 +21,17 @@ from internet import (
     InternetManager,
 )
 from document_search import DocumentStore, SearchResult
-from memory import ALLOWED_CATEGORIES, MemoryStore
+from memory import (
+    ALLOWED_CATEGORIES,
+    ALLOWED_PRIVACY_LEVELS,
+    ALLOWED_RETRIEVAL_POLICIES,
+    MemoryStore,
+)
+from private_memory import (
+    PrivateMemoryError,
+    PrivateMemoryLockedError,
+    PrivateMemoryVault,
+)
 from memory_review import (
     MemoryReviewEngine,
     MemoryReviewOutcome,
@@ -55,6 +66,8 @@ TOOL_AUDIT_DATABASE = BASE_DIRECTORY / "data" / "tool_audit.db"
 INTERNET_SETTINGS = BASE_DIRECTORY / "data" / "internet_settings.json"
 WORKFLOW_DATABASE = BASE_DIRECTORY / "data" / "workflows.db"
 DOCUMENTS_DIRECTORY = BASE_DIRECTORY / "documents"
+PRIVATE_MEMORY_VAULT = BASE_DIRECTORY / "data" / "private_memories.enc"
+PRIVATE_MEMORY_SALT = BASE_DIRECTORY / "data" / "private_memory.salt"
 
 MODEL_NAME = "qwen3.5:4b"
 MAX_CONVERSATION_TURNS = 8
@@ -63,7 +76,7 @@ MEMORY_RESULTS_PER_QUERY = 6
 
 
 CURRENT_PROJECT_STATE = """
-Elise version: 1.1.0-dev5.1
+Elise version: 1.1.0-dev6
 
 Completed and currently working:
 - Ollama is installed on Windows.
@@ -82,6 +95,17 @@ Completed and currently working:
 - SQLite memory connections close deterministically so temporary databases are not
   left locked on Windows.
 - Profile reports render normal blank lines rather than literal escape markers.
+- Ordinary and personal memories have retrieval policies and optional expiration.
+- Automatic memory review remains ordinary-only; personal memories require explicit
+  commands or reviewed profile imports.
+- Sensitive memories are manual-only and stored in a separate passphrase-encrypted
+  local vault; the passphrase is never persisted.
+- Normal chat excludes explicit-only, never-prompt, expired, and locked sensitive
+  memories.
+- Memory retrieval events store a query hash and a human-readable reason without
+  storing the raw user query.
+- Memories support inspection, editing, policy changes, expiration, and permanent
+  deletion.
 - Basic offline local-document indexing is working.
 - Basic keyword search across text-based local documents is working.
 - Generic search terms are filtered to reduce irrelevant document retrieval.
@@ -841,8 +865,29 @@ def print_help() -> None:
     print(
         "\nAvailable commands:\n"
         "  /remember <category> <text>\n"
-        "      Save a confirmed persistent memory.\n"
+        "      Save an ordinary when-relevant memory.\n"
         "      Categories: fact, preference, goal, project, observation\n"
+        "\n"
+        "  /remember-personal <policy> <category> <text>\n"
+        "      Save a personal memory. Policies: when_relevant, explicit_only, never_prompt.\n"
+        "\n"
+        "  /memory <id>\n"
+        "      Show one memory's privacy, policy, expiration, and provenance.\n"
+        "\n"
+        "  /edit-memory <id> <text>\n"
+        "      Replace one ordinary or personal memory's text.\n"
+        "\n"
+        "  /set-memory-policy <id> <policy>\n"
+        "      Change when a memory may be retrieved.\n"
+        "\n"
+        "  /expire-memory <id> <YYYY-MM-DD|never>\n"
+        "      Set or clear one memory's expiration.\n"
+        "\n"
+        "  /memory-why [limit]\n"
+        "      Show recent retrieval reasons without raw query text.\n"
+        "\n"
+        "  /private-memory <command>\n"
+        "      Manage the locked encrypted sensitive-memory vault.\n"
         "\n"
         "  /memory-review [status|on|off]\n"
         "      Show or change automatic approval-gated memory review.\n"
@@ -1580,6 +1625,15 @@ def print_memory_suggestion(
         f"  confidence: {float(suggestion['confidence']):.2f}"
     )
     print(
+        f"  privacy: {suggestion['privacy_level']}"
+    )
+    print(
+        f"  retrieval policy: {suggestion['retrieval_policy']}"
+    )
+    print(
+        f"  expires: {suggestion['expires_at'] or 'never'}"
+    )
+    print(
         f"  created: {suggestion['created_at']}"
     )
     print(
@@ -1958,10 +2012,10 @@ def print_memories(
     for memory in memories:
         print(
             f"  {memory['id']}. "
-            f"[{memory['category']} | "
-            f"{memory['status']} | "
-            f"{memory['confidence']:.2f}] "
-            f"{memory['content']}"
+            f"[{memory['category']} | {memory['privacy_level']} | "
+            f"{memory['retrieval_policy']} | {memory['status']} | "
+            f"{memory['confidence']:.2f} | expires "
+            f"{memory['expires_at'] or 'never'}] {memory['content']}"
         )
 
 
@@ -1982,11 +2036,11 @@ def print_memory_search_results(
         print(
             f"  {result['id']}. "
             f"[score {result['relevance_score']:.2f} | "
-            f"{result['category']} | "
-            f"{result['status']} | "
-            f"confidence {result['confidence']:.2f}] "
-            f"{result['content']}"
+            f"{result['category']} | {result['privacy_level']} | "
+            f"{result['retrieval_policy']} | {result['status']} | "
+            f"confidence {result['confidence']:.2f}] {result['content']}"
         )
+        print(f"     why: {result['retrieval_reason']}")
 
 
 def print_documents(
@@ -3639,6 +3693,8 @@ def handle_remember_command(
             status="confirmed",
             confidence=1.0,
             source="user_command",
+            privacy_level="ordinary",
+            retrieval_policy="when_relevant",
         )
 
         if was_added:
@@ -3679,6 +3735,193 @@ def handle_forget_command(
         print(
             f"Elise: Memory {memory_id} was not found."
         )
+
+
+
+def handle_remember_personal_command(user_input: str, memory_store: MemoryStore) -> None:
+    try:
+        parts = shlex.split(user_input)
+    except ValueError as error:
+        print(f"Elise: Unable to parse command: {error}")
+        return
+    if len(parts) < 4:
+        print("Elise: Usage: /remember-personal <policy> <category> <text>")
+        return
+    _, policy, category, *content_parts = parts
+    try:
+        added = memory_store.add(
+            content=" ".join(content_parts), category=category,
+            status="confirmed", confidence=1.0, source="user_personal_command",
+            privacy_level="personal", retrieval_policy=policy,
+        )
+        print("Elise: Saved personal memory." if added else "Elise: That memory already exists.")
+    except ValueError as error:
+        print(f"Elise: {error}")
+
+
+def handle_memory_detail_command(user_input: str, memory_store: MemoryStore) -> None:
+    _, _, raw_id = user_input.partition(" ")
+    try:
+        memory_id = int(raw_id.strip())
+    except ValueError:
+        print("Elise: Usage: /memory <id>")
+        return
+    row = memory_store.get(memory_id)
+    if row is None:
+        print(f"Elise: Memory {memory_id} was not found.")
+        return
+    print(f"\nMemory #{row['id']}")
+    for key in ("content", "category", "status", "confidence", "source", "privacy_level", "retrieval_policy", "expires_at", "created_at", "updated_at"):
+        print(f"  {key}: {row[key]}")
+
+
+def handle_edit_memory_command(user_input: str, memory_store: MemoryStore) -> None:
+    _, _, remainder = user_input.partition(" ")
+    raw_id, separator, content = remainder.partition(" ")
+    if not separator or not content.strip():
+        print("Elise: Usage: /edit-memory <id> <new text>")
+        return
+    try:
+        memory_id = int(raw_id)
+    except ValueError:
+        print("Elise: Memory ID must be an integer.")
+        return
+    row = memory_store.get(memory_id)
+    if row is None:
+        print(f"Elise: Memory {memory_id} was not found.")
+        return
+    try:
+        updated = memory_store.update(
+            memory_id, content=content.strip(), category=str(row["category"]),
+            status=str(row["status"]), confidence=float(row["confidence"]),
+            source="user_edit", privacy_level=str(row["privacy_level"]),
+            retrieval_policy=str(row["retrieval_policy"]),
+        )
+        print(f"Elise: Memory {memory_id} updated." if updated else f"Elise: Memory {memory_id} was not found.")
+    except ValueError as error:
+        print(f"Elise: {error}")
+
+
+def handle_set_memory_policy_command(user_input: str, memory_store: MemoryStore) -> None:
+    parts = user_input.split()
+    if len(parts) != 3:
+        print("Elise: Usage: /set-memory-policy <id> <when_relevant|explicit_only|never_prompt>")
+        return
+    try:
+        memory_id = int(parts[1])
+        updated = memory_store.set_retrieval_policy(memory_id, parts[2])
+        print(f"Elise: Memory {memory_id} policy updated." if updated else f"Elise: Memory {memory_id} was not found.")
+    except ValueError as error:
+        print(f"Elise: {error}")
+
+
+def handle_expire_memory_command(user_input: str, memory_store: MemoryStore) -> None:
+    parts = user_input.split()
+    if len(parts) != 3:
+        print("Elise: Usage: /expire-memory <id> <YYYY-MM-DD|never>")
+        return
+    try:
+        memory_id = int(parts[1])
+        updated = memory_store.set_expiration(memory_id, parts[2])
+        print(f"Elise: Memory {memory_id} expiration updated." if updated else f"Elise: Memory {memory_id} was not found.")
+    except ValueError as error:
+        print(f"Elise: {error}")
+
+
+def handle_memory_why_command(user_input: str, memory_store: MemoryStore) -> None:
+    parts = user_input.split()
+    try:
+        limit = 20 if len(parts) == 1 else int(parts[1])
+    except ValueError:
+        print("Elise: Usage: /memory-why [limit]")
+        return
+    rows = memory_store.recent_retrievals(limit)
+    if not rows:
+        print("Elise: No memory retrieval events are recorded.")
+        return
+    print("\nRecent memory retrievals (raw queries are not stored):")
+    for row in rows:
+        print(f"  {row['retrieved_at']} memory #{row['memory_id']} [{row['retrieval_context']}] {row['reason']} query-hash={str(row['query_hash'])[:12]}")
+
+
+def print_private_memory_status(vault: PrivateMemoryVault) -> None:
+    print("Elise: Private-memory vault is " + ("unlocked." if vault.is_unlocked else "locked."))
+
+
+def handle_private_memory_command(user_input: str, vault: PrivateMemoryVault) -> None:
+    try:
+        parts = shlex.split(user_input)
+    except ValueError as error:
+        print(f"Elise: Unable to parse command: {error}")
+        return
+    if len(parts) == 1 or parts[1].lower() == "status":
+        print_private_memory_status(vault)
+        return
+    action = parts[1].lower()
+    try:
+        if action == "unlock":
+            passphrase = getpass.getpass("Private-memory passphrase: ")
+            vault.unlock(passphrase)
+            print("Elise: Private-memory vault unlocked for this session.")
+        elif action == "lock":
+            vault.lock()
+            print("Elise: Private-memory vault locked.")
+        elif action == "list":
+            rows = vault.list_all(include_expired=True)
+            if not rows:
+                print("Elise: No sensitive memories are stored.")
+            else:
+                print("\nSensitive memories (vault is unlocked):")
+                for row in rows:
+                    print(f"  {row.id}. [{row.category} | {row.retrieval_policy} | expires {row.expires_at or 'never'}] {row.content}")
+        elif action == "add":
+            if len(parts) not in {4, 5}:
+                print("Elise: Usage: /private-memory add <category> <explicit_only|never_prompt> [YYYY-MM-DD|never]")
+                return
+            content = getpass.getpass("Sensitive memory (hidden input): ")
+            memory_id = vault.add(content=content, category=parts[2], retrieval_policy=parts[3], expires_at=(parts[4] if len(parts) == 5 else None))
+            print(f"Elise: Encrypted sensitive memory {memory_id} saved.")
+        elif action == "search":
+            query = " ".join(parts[2:]).strip()
+            if not query:
+                print("Elise: Usage: /private-memory search <query>")
+                return
+            rows = vault.search(query)
+            if not rows:
+                print("Elise: No explicit-only sensitive memories matched.")
+            for row in rows:
+                print(f"  {row['id']}. [score {row['relevance_score']:.2f}] {row['content']}\n     why: {row['retrieval_reason']}")
+        elif action == "show":
+            if len(parts) != 3:
+                print("Elise: Usage: /private-memory show <S-id>")
+                return
+            row = vault.get(parts[2])
+            print(f"Elise: Sensitive memory {parts[2]} was not found." if row is None else f"\n{row.id}: {row.content}\n  category: {row.category}\n  policy: {row.retrieval_policy}\n  expires: {row.expires_at or 'never'}")
+        elif action == "edit":
+            if len(parts) != 3:
+                print("Elise: Usage: /private-memory edit <S-id>")
+                return
+            content = getpass.getpass("Replacement sensitive memory (hidden input): ")
+            print(f"Elise: Sensitive memory {parts[2]} updated." if vault.update(parts[2], content=content) else f"Elise: Sensitive memory {parts[2]} was not found.")
+        elif action == "policy":
+            if len(parts) != 4:
+                print("Elise: Usage: /private-memory policy <S-id> <explicit_only|never_prompt>")
+                return
+            print(f"Elise: Sensitive memory {parts[2]} policy updated." if vault.set_policy(parts[2], parts[3]) else f"Elise: Sensitive memory {parts[2]} was not found.")
+        elif action == "expire":
+            if len(parts) != 4:
+                print("Elise: Usage: /private-memory expire <S-id> <YYYY-MM-DD|never>")
+                return
+            print(f"Elise: Sensitive memory {parts[2]} expiration updated." if vault.set_expiration(parts[2], parts[3]) else f"Elise: Sensitive memory {parts[2]} was not found.")
+        elif action == "forget":
+            if len(parts) != 3:
+                print("Elise: Usage: /private-memory forget <S-id>")
+                return
+            print(f"Elise: Sensitive memory {parts[2]} permanently deleted." if vault.delete(parts[2]) else f"Elise: Sensitive memory {parts[2]} was not found.")
+        else:
+            print("Elise: Private-memory commands: status, unlock, lock, list, add, search, show, edit, policy, expire, forget")
+    except (PrivateMemoryLockedError, PrivateMemoryError, ValueError, OSError) as error:
+        print(f"Elise: {error}")
 
 
 def resolve_profile_path(
@@ -8630,6 +8873,8 @@ def request_model_response(
         memory_results = memory_store.search(
             user_query,
             top_k=MEMORY_RESULTS_PER_QUERY,
+            explicit=False,
+            retrieval_context="automatic_chat",
         )
 
     model_messages = build_messages(
@@ -8812,6 +9057,10 @@ def main() -> int:
     memory_store = MemoryStore(
         MEMORY_DATABASE
     )
+    private_memory_vault = PrivateMemoryVault(
+        PRIVATE_MEMORY_VAULT,
+        PRIVATE_MEMORY_SALT,
+    )
 
     memory_review_settings = (
         MemoryReviewSettings(
@@ -8865,7 +9114,7 @@ def main() -> int:
     history: list[dict[str, Any]] = []
 
     print("=" * 55)
-    print("Elise 1.1.0-dev5.1")
+    print("Elise 1.1.0-dev6")
     print(f"Local model: {MODEL_NAME}")
     print("Model runtime: Ollama")
     print(
@@ -8878,7 +9127,10 @@ def main() -> int:
         f"{chunk_count} searchable sections"
     )
     print(
-        "Relevant-memory retrieval: enabled"
+        "Relevant-memory retrieval: privacy-policy filtered"
+    )
+    print(
+        "Private sensitive memory: locked encrypted vault"
     )
     print(
         "Automatic memory review: "
@@ -9395,6 +9647,34 @@ def main() -> int:
             )
             continue
 
+        if lowered_input == "/memory" or lowered_input.startswith("/memory "):
+            handle_memory_detail_command(user_input, memory_store)
+            continue
+
+        if lowered_input == "/remember-personal" or lowered_input.startswith("/remember-personal "):
+            handle_remember_personal_command(user_input, memory_store)
+            continue
+
+        if lowered_input == "/edit-memory" or lowered_input.startswith("/edit-memory "):
+            handle_edit_memory_command(user_input, memory_store)
+            continue
+
+        if lowered_input == "/set-memory-policy" or lowered_input.startswith("/set-memory-policy "):
+            handle_set_memory_policy_command(user_input, memory_store)
+            continue
+
+        if lowered_input == "/expire-memory" or lowered_input.startswith("/expire-memory "):
+            handle_expire_memory_command(user_input, memory_store)
+            continue
+
+        if lowered_input == "/memory-why" or lowered_input.startswith("/memory-why "):
+            handle_memory_why_command(user_input, memory_store)
+            continue
+
+        if lowered_input == "/private-memory" or lowered_input.startswith("/private-memory "):
+            handle_private_memory_command(user_input, private_memory_vault)
+            continue
+
         if lowered_input.startswith(
             "/search-memories "
         ):
@@ -9403,6 +9683,8 @@ def main() -> int:
             results = memory_store.search(
                 query=query,
                 top_k=MEMORY_RESULTS_PER_QUERY,
+                explicit=True,
+                retrieval_context="explicit_search",
             )
 
             print_memory_search_results(
@@ -9623,16 +9905,11 @@ def main() -> int:
                 )
 
             if memory_results:
-                retrieved_ids = ", ".join(
-                    str(memory["id"])
+                retrieved_details = "; ".join(
+                    f"{memory['id']} ({memory['privacy_level']}/{memory['retrieval_policy']}: {memory['matched_terms']})"
                     for memory in memory_results
                 )
-
-                print(
-                    "\n[Relevant memories retrieved: "
-                    + retrieved_ids
-                    + "]"
-                )
+                print("\n[Relevant memories retrieved: " + retrieved_details + "]")
 
             history.append(
                 {
