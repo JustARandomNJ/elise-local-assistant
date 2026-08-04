@@ -1088,6 +1088,317 @@ class WorkflowStore:
             steps=steps,
         )
 
+
+    def _create_document_template_workflow(
+        self,
+        *,
+        workflow_type: str,
+        source_paths: Sequence[str],
+        destination_path: str,
+        operation_label: str,
+        original_request: str,
+    ) -> WorkflowRun:
+        if workflow_type not in {
+            "document_summary",
+            "document_action_items",
+            "compare_documents",
+        }:
+            raise WorkflowValidationError(
+                f"Unsupported workflow template: {workflow_type}"
+            )
+
+        validated_sources = [
+            self._validate_relative_path(
+                source_path,
+                label=(
+                    f"Source path {index}"
+                ),
+            )
+            for index, source_path in enumerate(
+                source_paths,
+                start=1,
+            )
+        ]
+        destination = self._validate_relative_path(
+            destination_path,
+            label="Destination path",
+        )
+
+        expected_count = (
+            2
+            if workflow_type
+            == "compare_documents"
+            else 1
+        )
+
+        if (
+            len(validated_sources)
+            != expected_count
+        ):
+            raise WorkflowValidationError(
+                f"{workflow_type} requires "
+                f"exactly {expected_count} source file(s)."
+            )
+
+        if (
+            len(set(validated_sources))
+            != len(validated_sources)
+        ):
+            raise WorkflowValidationError(
+                "Source paths must be distinct."
+            )
+
+        if destination in validated_sources:
+            raise WorkflowValidationError(
+                "The destination path must differ from every source path."
+            )
+
+        steps = [
+            {
+                "action_name": "locate_sources",
+                "display_name": (
+                    "Locate the source file"
+                    if expected_count == 1
+                    else "Locate both source files"
+                ),
+                "arguments": {
+                    "source_paths": (
+                        validated_sources
+                    ),
+                },
+            },
+            {
+                "action_name": "read_sources",
+                "display_name": (
+                    "Read the source file"
+                    if expected_count == 1
+                    else "Read both source files"
+                ),
+                "arguments": {
+                    "source_paths": (
+                        validated_sources
+                    ),
+                },
+            },
+            {
+                "action_name": "generate_output",
+                "display_name": (
+                    f"Generate {operation_label}"
+                ),
+                "arguments": {
+                    "source_paths": (
+                        validated_sources
+                    ),
+                    "operation": (
+                        workflow_type
+                    ),
+                },
+            },
+            {
+                "action_name": "preview_destination",
+                "display_name": (
+                    "Preview the destination file"
+                ),
+                "arguments": {
+                    "destination_path": (
+                        destination
+                    ),
+                },
+            },
+            {
+                "action_name": "confirm_write",
+                "display_name": (
+                    "Wait for write confirmation"
+                ),
+                "arguments": {
+                    "destination_path": (
+                        destination
+                    ),
+                },
+                "requires_confirmation": (
+                    True
+                ),
+            },
+            {
+                "action_name": "write_destination",
+                "display_name": (
+                    "Write the confirmed output"
+                ),
+                "arguments": {
+                    "destination_path": (
+                        destination
+                    ),
+                },
+            },
+            {
+                "action_name": "reindex_documents",
+                "display_name": (
+                    "Reindex local documents"
+                ),
+                "arguments": {
+                    "destination_path": (
+                        destination
+                    ),
+                },
+            },
+            {
+                "action_name": "report_completion",
+                "display_name": (
+                    "Report workflow completion"
+                ),
+                "arguments": {},
+            },
+        ]
+
+        return self.create_workflow(
+            original_request=(
+                original_request
+            ),
+            workflow_type=(
+                workflow_type
+            ),
+            steps=steps,
+        )
+
+    def create_document_summary_workflow(
+        self,
+        *,
+        source_path: str,
+        destination_path: str,
+        original_request: str | None = None,
+    ) -> WorkflowRun:
+        source = self._validate_relative_path(
+            source_path,
+            label="Source path",
+        )
+        destination = self._validate_relative_path(
+            destination_path,
+            label="Destination path",
+        )
+        request = (
+            original_request.strip()
+            if original_request
+            else (
+                f"Read {source}, summarize the document, "
+                f"and save the summary to {destination}."
+            )
+        )
+
+        return (
+            self._create_document_template_workflow(
+                workflow_type=(
+                    "document_summary"
+                ),
+                source_paths=[
+                    source
+                ],
+                destination_path=(
+                    destination
+                ),
+                operation_label=(
+                    "a source-grounded document summary"
+                ),
+                original_request=(
+                    request
+                ),
+            )
+        )
+
+    def create_action_items_workflow(
+        self,
+        *,
+        source_path: str,
+        destination_path: str,
+        original_request: str | None = None,
+    ) -> WorkflowRun:
+        source = self._validate_relative_path(
+            source_path,
+            label="Source path",
+        )
+        destination = self._validate_relative_path(
+            destination_path,
+            label="Destination path",
+        )
+        request = (
+            original_request.strip()
+            if original_request
+            else (
+                f"Read {source}, extract explicit action items, "
+                f"and save them to {destination}."
+            )
+        )
+
+        return (
+            self._create_document_template_workflow(
+                workflow_type=(
+                    "document_action_items"
+                ),
+                source_paths=[
+                    source
+                ],
+                destination_path=(
+                    destination
+                ),
+                operation_label=(
+                    "source-grounded action items"
+                ),
+                original_request=(
+                    request
+                ),
+            )
+        )
+
+    def create_document_comparison_workflow(
+        self,
+        *,
+        source_path_a: str,
+        source_path_b: str,
+        destination_path: str,
+        original_request: str | None = None,
+    ) -> WorkflowRun:
+        source_a = self._validate_relative_path(
+            source_path_a,
+            label="First source path",
+        )
+        source_b = self._validate_relative_path(
+            source_path_b,
+            label="Second source path",
+        )
+        destination = self._validate_relative_path(
+            destination_path,
+            label="Destination path",
+        )
+        request = (
+            original_request.strip()
+            if original_request
+            else (
+                f"Compare {source_a} with {source_b} using only "
+                f"their contents, and save the comparison to "
+                f"{destination}."
+            )
+        )
+
+        return (
+            self._create_document_template_workflow(
+                workflow_type=(
+                    "compare_documents"
+                ),
+                source_paths=[
+                    source_a,
+                    source_b,
+                ],
+                destination_path=(
+                    destination
+                ),
+                operation_label=(
+                    "a source-grounded document comparison"
+                ),
+                original_request=(
+                    request
+                ),
+            )
+        )
+
     def get_workflow(
         self,
         workflow_id: int,
