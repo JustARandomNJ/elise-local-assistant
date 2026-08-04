@@ -21,7 +21,7 @@ from typing import Any, Callable
 import zlib
 
 
-SUITE_VERSION = "1.2.0"
+SUITE_VERSION = "1.3.0"
 DEFAULT_GROUPS = {
     "structure",
     "memory",
@@ -32,6 +32,7 @@ DEFAULT_GROUPS = {
     "app",
     "workflow",
     "workflow-execution",
+    "workflow-templates",
 }
 OPTIONAL_GROUPS = {
     "live-internet",
@@ -2458,6 +2459,454 @@ def check_workflow_execution(
     )
 
 
+
+def check_workflow_templates(
+    project_root: Path,
+) -> str:
+    workflow_module = import_fresh(
+        "workflow"
+    )
+    execution_module = import_fresh(
+        "workflow_execution"
+    )
+    tools_module = import_fresh(
+        "tools"
+    )
+    audit_module = import_fresh(
+        "audit"
+    )
+
+    WorkflowStore = workflow_module.WorkflowStore
+    WorkflowStatus = workflow_module.WorkflowStatus
+    StepStatus = workflow_module.StepStatus
+    WorkflowValidationError = (
+        workflow_module.WorkflowValidationError
+    )
+    WorkflowExecutor = (
+        execution_module.WorkflowExecutor
+    )
+    ToolManager = tools_module.ToolManager
+    ToolAuditLog = audit_module.ToolAuditLog
+
+    class FakeDocumentStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def reindex(
+            self,
+        ) -> tuple[int, int]:
+            self.calls += 1
+            return 4, 8
+
+    with tempfile.TemporaryDirectory(
+        prefix="elise-regression-workflow-templates-",
+        ignore_cleanup_errors=True,
+    ) as temporary_directory:
+        temporary_root = Path(
+            temporary_directory
+        )
+        documents = (
+            temporary_root
+            / "documents"
+        )
+        data = (
+            temporary_root
+            / "data"
+        )
+        documents.mkdir()
+        data.mkdir()
+
+        first_text = (
+            "Project Alpha is an offline assistant. "
+            "Next task: add automatic memory review. "
+            "The current storage layer uses SQLite."
+        )
+        second_text = (
+            "Project Beta uses JSON files. "
+            "It has no automatic memory review. "
+            "Both projects run locally."
+        )
+        (
+            documents
+            / "alpha.md"
+        ).write_text(
+            first_text,
+            encoding="utf-8",
+        )
+        (
+            documents
+            / "beta.md"
+        ).write_text(
+            second_text,
+            encoding="utf-8",
+        )
+
+        workflow_store = WorkflowStore(
+            data
+            / "workflows.db"
+        )
+        tool_manager = ToolManager(
+            project_directory=(
+                temporary_root
+            ),
+            documents_directory=(
+                documents
+            ),
+        )
+        audit_log = ToolAuditLog(
+            data
+            / "tool_audit.db"
+        )
+        document_store = (
+            FakeDocumentStore()
+        )
+        calls: list[
+            tuple[
+                str,
+                list[
+                    tuple[str, str]
+                ],
+            ]
+        ] = []
+
+        generated_by_operation = {
+            "document_summary": (
+                "# Document Summary\n\n"
+                "Project Alpha is a local assistant "
+                "that stores state in SQLite."
+            ),
+            "action_items": (
+                "# Action Items\n\n"
+                "- Add automatic memory review."
+            ),
+            "document_comparison": (
+                "# Document Comparison\n\n"
+                "## Similarities\n"
+                "- Both run locally.\n\n"
+                "## Differences\n"
+                "- Alpha uses SQLite; Beta uses JSON."
+            ),
+        }
+
+        def generate_text(
+            operation: str,
+            sources: list[
+                tuple[str, str]
+            ],
+        ) -> str:
+            calls.append(
+                (
+                    operation,
+                    list(
+                        sources
+                    ),
+                )
+            )
+            return (
+                generated_by_operation[
+                    operation
+                ]
+            )
+
+        summary = (
+            workflow_store
+            .create_document_summary_workflow(
+                source_path=(
+                    "documents/alpha.md"
+                ),
+                destination_path=(
+                    "documents/alpha-summary.md"
+                ),
+            )
+        )
+        actions = (
+            workflow_store
+            .create_action_items_workflow(
+                source_path=(
+                    "documents/alpha.md"
+                ),
+                destination_path=(
+                    "documents/alpha-actions.md"
+                ),
+            )
+        )
+        comparison = (
+            workflow_store
+            .create_document_comparison_workflow(
+                source_path_a=(
+                    "documents/alpha.md"
+                ),
+                source_path_b=(
+                    "documents/beta.md"
+                ),
+                destination_path=(
+                    "documents/comparison.md"
+                ),
+            )
+        )
+
+        require(
+            summary.workflow_type
+            == "document_summary",
+            "Summary factory created the wrong workflow type.",
+        )
+        require(
+            actions.workflow_type
+            == "document_action_items",
+            "Action-item factory created the wrong workflow type.",
+        )
+        require(
+            comparison.workflow_type
+            == "compare_documents",
+            "Comparison factory created the wrong workflow type.",
+        )
+        require(
+            all(
+                len(workflow.steps)
+                == 8
+                for workflow in (
+                    summary,
+                    actions,
+                    comparison,
+                )
+            ),
+            "A deterministic template did not contain eight steps.",
+        )
+        require(
+            [
+                step.action_name
+                for step in comparison.steps
+            ]
+            == [
+                "locate_sources",
+                "read_sources",
+                "generate_output",
+                "preview_destination",
+                "confirm_write",
+                "write_destination",
+                "reindex_documents",
+                "report_completion",
+            ],
+            "Comparison template action order changed.",
+        )
+
+        try:
+            (
+                workflow_store
+                .create_document_comparison_workflow(
+                    source_path_a=(
+                        "documents/alpha.md"
+                    ),
+                    source_path_b=(
+                        "documents/alpha.md"
+                    ),
+                    destination_path=(
+                        "documents/invalid.md"
+                    ),
+                )
+            )
+        except WorkflowValidationError:
+            pass
+        else:
+            raise AssertionError(
+                "Comparison accepted duplicate source paths."
+            )
+
+        try:
+            (
+                workflow_store
+                .create_document_summary_workflow(
+                    source_path=(
+                        "documents/alpha.md"
+                    ),
+                    destination_path=(
+                        "documents/alpha.md"
+                    ),
+                )
+            )
+        except WorkflowValidationError:
+            pass
+        else:
+            raise AssertionError(
+                "Template accepted a destination matching its source."
+            )
+
+        executor = WorkflowExecutor(
+            workflow_store=workflow_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=(
+                document_store
+            ),
+            generate_text=generate_text,
+            render_write_preview=(
+                lambda preview, policy: None
+            ),
+            request_confirmation=(
+                lambda: True
+            ),
+            output=(
+                lambda message: None
+            ),
+        )
+
+        completed = [
+            executor.execute(
+                workflow.id
+            )
+            for workflow in (
+                summary,
+                actions,
+                comparison,
+            )
+        ]
+
+        require(
+            all(
+                workflow.status
+                is WorkflowStatus.COMPLETED
+                for workflow in completed
+            ),
+            "One or more approved workflow templates did not complete.",
+        )
+        require(
+            all(
+                all(
+                    step.status
+                    is StepStatus.COMPLETED
+                    for step in workflow.steps
+                )
+                for workflow in completed
+            ),
+            "A completed workflow template left an incomplete step.",
+        )
+        require(
+            document_store.calls
+            == 3,
+            "Template execution did not reindex once per approved write.",
+        )
+
+        expected_files = {
+            "alpha-summary.md": (
+                generated_by_operation[
+                    "document_summary"
+                ]
+                + "\n"
+            ),
+            "alpha-actions.md": (
+                generated_by_operation[
+                    "action_items"
+                ]
+                + "\n"
+            ),
+            "comparison.md": (
+                generated_by_operation[
+                    "document_comparison"
+                ]
+                + "\n"
+            ),
+        }
+
+        for (
+            file_name,
+            expected_content,
+        ) in expected_files.items():
+            actual_content = (
+                documents
+                / file_name
+            ).read_text(
+                encoding="utf-8"
+            )
+            require(
+                actual_content
+                == expected_content,
+                f"{file_name} contains unexpected workflow output.",
+            )
+
+        require(
+            [
+                operation
+                for (
+                    operation,
+                    sources,
+                ) in calls
+            ]
+            == [
+                "document_summary",
+                "action_items",
+                "document_comparison",
+            ],
+            "Workflow operation routing changed.",
+        )
+        require(
+            len(
+                calls[
+                    2
+                ][
+                    1
+                ]
+            )
+            == 2,
+            "Comparison generator did not receive two sources.",
+        )
+        require(
+            calls[
+                2
+            ][
+                1
+            ][
+                0
+            ][
+                0
+            ]
+            == "documents/alpha.md",
+            "Comparison source order changed.",
+        )
+        require(
+            calls[
+                2
+            ][
+                1
+            ][
+                1
+            ][
+                0
+            ]
+            == "documents/beta.md",
+            "Comparison second source path changed.",
+        )
+
+        database_bytes = (
+            data
+            / "workflows.db"
+        ).read_bytes()
+        require(
+            first_text.encode(
+                "utf-8"
+            )
+            not in database_bytes,
+            "Workflow database stored full first-source content.",
+        )
+        require(
+            second_text.encode(
+                "utf-8"
+            )
+            not in database_bytes,
+            "Workflow database stored full second-source content.",
+        )
+        require(
+            audit_log.count()
+            >= 11,
+            "Reusable template tool actions were not audited.",
+        )
+
+    return (
+        "Summary, action-item, and comparison templates; reusable actions; "
+        "validation; grounded operation routing; writes; auditing; and "
+        "metadata-only persistence passed"
+    )
+
+
 def check_app_pure_functions(
     project_root: Path,
 ) -> str:
@@ -2778,7 +3227,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Run selected groups only. Repeat the option or use commas. "
             "Groups: structure, memory, documents, tools, audit, internet, "
-            "workflow, workflow-execution, app, live-internet, live-model."
+            "workflow, workflow-execution, workflow-templates, app, "
+            "live-internet, live-model."
         ),
     )
     parser.add_argument(
@@ -2963,6 +3413,13 @@ def main() -> int:
         "workflow-execution",
         "safe read-summarize-confirm-write execution",
         lambda: check_workflow_execution(
+            project_root
+        ),
+    )
+    runner.run(
+        "workflow-templates",
+        "approved reusable workflow templates",
+        lambda: check_workflow_templates(
             project_root
         ),
     )
