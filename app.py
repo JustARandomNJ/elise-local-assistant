@@ -21,6 +21,13 @@ from internet import (
 )
 from document_search import DocumentStore, SearchResult
 from memory import ALLOWED_CATEGORIES, MemoryStore
+from memory_review import (
+    MemoryReviewEngine,
+    MemoryReviewOutcome,
+    MemoryReviewSettings,
+    build_memory_review_messages,
+    is_likely_memory_declaration,
+)
 from tools import ToolManager
 from workflow import (
     WorkflowNotFoundError,
@@ -34,6 +41,7 @@ from workflow_execution import WorkflowExecutor
 
 BASE_DIRECTORY = Path(__file__).resolve().parent
 MEMORY_DATABASE = BASE_DIRECTORY / "data" / "elise.db"
+MEMORY_REVIEW_SETTINGS = BASE_DIRECTORY / "data" / "memory_review_settings.json"
 TOOL_AUDIT_DATABASE = BASE_DIRECTORY / "data" / "tool_audit.db"
 INTERNET_SETTINGS = BASE_DIRECTORY / "data" / "internet_settings.json"
 WORKFLOW_DATABASE = BASE_DIRECTORY / "data" / "workflows.db"
@@ -46,7 +54,7 @@ MEMORY_RESULTS_PER_QUERY = 6
 
 
 CURRENT_PROJECT_STATE = """
-Elise version: 1.1.0-dev3
+Elise version: 1.1.0-dev4.2
 
 Completed and currently working:
 - Ollama is installed on Windows.
@@ -70,6 +78,25 @@ Completed and currently working:
 - Retrieved memory IDs are shown in the terminal for debugging.
 - Normal questions no longer automatically search unrelated local documents.
 - Basic memory-query expansion supports common personal-context questions.
+- Automatic memory review can identify one directly stated durable user detail
+  after a normal conversation turn.
+- Automatic memory candidates are filtered for temporary, uncertain, sensitive,
+  contact, exact-location, and third-party information before storage.
+- Memory review compares candidates against existing memories and distinguishes
+  new, duplicate, and conflicting information.
+- Automatic memory review never writes directly to confirmed memory; every new
+  or conflicting candidate is persisted as a pending suggestion.
+- The user can approve or reject each suggestion explicitly, and approving a
+  conflict replaces only the displayed related memory while preserving its ID.
+- Automatic memory review can be turned on or off persistently.
+- Explicit standing-preference statements are acknowledged without exposing
+  filesystem tools.
+- Memory suggestion displays include creation time and a source-hash fingerprint.
+- Automatic review reports when a statement is already covered by confirmed memory.
+- Model-declared duplicate relationships are host-validated before they can suppress
+  a new suggestion.
+- Explicit preference statements receive a deterministic candidate fallback when the
+  model returns no candidate.
 - A strict permission-gated local tool allowlist is working.
 - Explicit terminal commands can use automatic read tools and
   confirmation-gated write tools.
@@ -343,6 +370,9 @@ Tool rules:
 - Never claim to have used a tool unless the host provides its result in the
   current context.
 - Never invent a tool result.
+- A standing user preference is not a request to edit existing files.
+- Never fabricate a confirmation preview, file path, content hash, audit record,
+  or applied edit in response to a preference statement.
 - Every tool request and final decision is audited by the host.
 - Write content is omitted from audit logs and represented only by size and a
   SHA-256 fingerprint.
@@ -798,6 +828,18 @@ def print_help() -> None:
         "  /remember <category> <text>\n"
         "      Save a confirmed persistent memory.\n"
         "      Categories: fact, preference, goal, project, observation\n"
+        "\n"
+        "  /memory-review [status|on|off]\n"
+        "      Show or change automatic approval-gated memory review.\n"
+        "\n"
+        "  /memory-suggestions [all]\n"
+        "      Show pending suggestions or recent suggestions of every status.\n"
+        "\n"
+        "  /approve-memory <suggestion-id>\n"
+        "      Save a new suggestion or replace its displayed conflict target.\n"
+        "\n"
+        "  /reject-memory <suggestion-id>\n"
+        "      Reject one pending automatic memory suggestion.\n"
         "\n"
         "  /memories\n"
         "      Show all persistent memories.\n"
@@ -1483,6 +1525,391 @@ def handle_cancel_workflow_command(
     )
 
 
+
+
+def build_memory_declaration_acknowledgment(
+    user_text: str,
+) -> str:
+    """
+    Return a safe acknowledgment for an explicit standing preference.
+
+    Persistence is handled separately by approval-gated memory review.
+    """
+
+    return (
+        "Understood. I will use that as conversation context. "
+        "No files or settings were changed. Automatic memory review will "
+        "separately show any proposed persistent memory for your approval."
+    )
+
+
+def print_memory_suggestion(
+    memory_store: MemoryStore,
+    suggestion: sqlite3.Row,
+) -> None:
+    """Display one approval-gated memory suggestion."""
+
+    print(
+        f"\nMemory suggestion #{suggestion['id']}"
+    )
+    print(
+        f"  status: {suggestion['status']}"
+    )
+    print(
+        f"  category: {suggestion['category']}"
+    )
+    print(
+        f"  confidence: {float(suggestion['confidence']):.2f}"
+    )
+    print(
+        f"  created: {suggestion['created_at']}"
+    )
+    print(
+        "  source fingerprint: "
+        + str(
+            suggestion[
+                "source_hash"
+            ]
+        )[
+            :12
+        ]
+    )
+    print(
+        f"  proposed memory: {suggestion['content']}"
+    )
+    print(
+        f"  reason: {suggestion['reason']}"
+    )
+
+    if (
+        suggestion[
+            "relation"
+        ]
+        == "conflict"
+    ):
+        related_id = suggestion[
+            "related_memory_id"
+        ]
+        related = (
+            None
+            if related_id is None
+            else memory_store.get(
+                int(
+                    related_id
+                )
+            )
+        )
+        print(
+            f"  relation: conflicts with memory #{related_id}"
+        )
+
+        if related is not None:
+            print(
+                f"  existing memory: {related['content']}"
+            )
+
+        print(
+            "  approving replaces only that existing memory."
+        )
+    else:
+        print(
+            "  relation: new memory"
+        )
+
+    if (
+        suggestion[
+            "status"
+        ]
+        == "pending"
+    ):
+        print(
+            f"  approve: /approve-memory {suggestion['id']}"
+        )
+        print(
+            f"  reject:  /reject-memory {suggestion['id']}"
+        )
+
+
+def print_memory_suggestions(
+    memory_store: MemoryStore,
+    *,
+    include_all: bool = False,
+) -> None:
+    """Display pending or recent memory suggestions."""
+
+    suggestions = (
+        memory_store.list_suggestions(
+            status=(
+                None
+                if include_all
+                else "pending"
+            ),
+            limit=50,
+        )
+    )
+
+    if not suggestions:
+        print(
+            "Elise: No memory suggestions match that view."
+        )
+        return
+
+    heading = (
+        "Recent memory suggestions:"
+        if include_all
+        else "Pending memory suggestions:"
+    )
+    print(
+        "\n"
+        + heading
+    )
+
+    for suggestion in suggestions:
+        print_memory_suggestion(
+            memory_store,
+            suggestion,
+        )
+
+
+def print_automatic_memory_outcome(
+    memory_store: MemoryStore,
+    outcome: MemoryReviewOutcome,
+) -> None:
+    """Show a new suggestion or explain a duplicate result."""
+
+    if outcome.status == "duplicate":
+        print(
+            "\n[Automatic memory review]"
+        )
+        print(
+            "No new suggestion was created because this statement "
+            + (
+                f"is already covered by memory #{outcome.related_memory_id}."
+                if outcome.related_memory_id is not None
+                else "is already covered by confirmed memory."
+            )
+        )
+        return
+
+    if outcome.status == "duplicate_pending":
+        print(
+            "\n[Automatic memory review]"
+        )
+        print(
+            "No new suggestion was created because an equivalent "
+            "suggestion is already pending."
+        )
+        return
+
+    if (
+        outcome.status
+        != "suggested"
+        or outcome.suggestion_id
+        is None
+    ):
+        return
+
+    suggestion = (
+        memory_store.get_suggestion(
+            outcome.suggestion_id
+        )
+    )
+
+    if suggestion is None:
+        return
+
+    print(
+        "\n[Automatic memory review]"
+    )
+    print_memory_suggestion(
+        memory_store,
+        suggestion,
+    )
+
+
+def handle_memory_review_command(
+    user_input: str,
+    settings: MemoryReviewSettings,
+) -> None:
+    """Show or change automatic memory-review state."""
+
+    _, _, action = user_input.partition(
+        " "
+    )
+    cleaned_action = (
+        action.strip().lower()
+        or "status"
+    )
+
+    if cleaned_action == "status":
+        print(
+            "Elise: Automatic memory review is "
+            + (
+                "enabled."
+                if settings.is_enabled()
+                else "disabled."
+            )
+        )
+        return
+
+    if cleaned_action == "on":
+        settings.set_enabled(
+            True
+        )
+        print(
+            "Elise: Automatic memory review enabled. "
+            "New memories still require explicit approval."
+        )
+        return
+
+    if cleaned_action == "off":
+        settings.set_enabled(
+            False
+        )
+        print(
+            "Elise: Automatic memory review disabled. "
+            "Existing pending suggestions were preserved."
+        )
+        return
+
+    print(
+        "Elise: Usage: /memory-review [status|on|off]"
+    )
+
+
+def handle_approve_memory_command(
+    user_input: str,
+    memory_store: MemoryStore,
+) -> None:
+    """Approve one pending memory suggestion."""
+
+    _, _, raw_id = user_input.partition(
+        " "
+    )
+
+    try:
+        suggestion_id = _parse_positive_integer(
+            raw_id,
+            label="Suggestion ID",
+        )
+    except ValueError as error:
+        print(
+            f"Elise: {error}"
+        )
+        return
+
+    result = memory_store.approve_suggestion(
+        suggestion_id
+    )
+
+    if not result.get(
+        "success"
+    ):
+        print(
+            "Elise: "
+            + str(
+                result.get(
+                    "error",
+                    "Memory suggestion could not be approved.",
+                )
+            )
+        )
+        return
+
+    action = result.get(
+        "action"
+    )
+    memory_id = result.get(
+        "memory_id"
+    )
+
+    if action == "created":
+        approved_memory = memory_store.get(
+            int(
+                memory_id
+            )
+        )
+        approved_content = (
+            ""
+            if approved_memory is None
+            else str(
+                approved_memory[
+                    "content"
+                ]
+            )
+        )
+        print(
+            f"Elise: Approved suggestion #{suggestion_id} "
+            f"and created memory #{memory_id}: {approved_content}"
+        )
+    elif action == "replaced":
+        print(
+            f"Elise: Approved suggestion #{suggestion_id} "
+            f"and replaced memory #{memory_id}."
+        )
+        print(
+            "Elise: Previous memory: "
+            + str(
+                result.get(
+                    "old_content",
+                    "",
+                )
+            )
+        )
+        print(
+            "Elise: Updated memory: "
+            + str(
+                result.get(
+                    "content",
+                    "",
+                )
+            )
+        )
+    elif action == "duplicate":
+        print(
+            f"Elise: Suggestion #{suggestion_id} already matched "
+            f"memory #{memory_id}; no duplicate was added."
+        )
+    else:
+        print(
+            f"Elise: Suggestion #{suggestion_id} was resolved."
+        )
+
+
+def handle_reject_memory_command(
+    user_input: str,
+    memory_store: MemoryStore,
+) -> None:
+    """Reject one pending memory suggestion."""
+
+    _, _, raw_id = user_input.partition(
+        " "
+    )
+
+    try:
+        suggestion_id = _parse_positive_integer(
+            raw_id,
+            label="Suggestion ID",
+        )
+    except ValueError as error:
+        print(
+            f"Elise: {error}"
+        )
+        return
+
+    if memory_store.reject_suggestion(
+        suggestion_id
+    ):
+        print(
+            f"Elise: Memory suggestion #{suggestion_id} rejected."
+        )
+    else:
+        print(
+            f"Elise: Pending memory suggestion #{suggestion_id} "
+            "was not found."
+        )
+
+
 def print_memories(
     memory_store: MemoryStore,
     category: str | None = None,
@@ -2149,6 +2576,44 @@ def generate_workflow_text(
         )
 
     return generated
+
+
+def extract_memory_candidate(
+    user_text: str,
+    existing_memories: list[
+        dict[str, Any]
+    ],
+) -> str:
+    """Ask the local model for one strict, conservative memory candidate."""
+
+    response = ollama.chat(
+        model=MODEL_NAME,
+        messages=build_memory_review_messages(
+            user_text=user_text,
+            existing_memories=(
+                existing_memories
+            ),
+        ),
+        format="json",
+        think=False,
+        options={
+            "temperature": 0.0,
+            "num_ctx": 4096,
+        },
+    )
+    content = (
+        response.message.content
+        or ""
+    ).strip()
+
+    if not content:
+        return json.dumps(
+            {
+                "should_suggest": False,
+            }
+        )
+
+    return content
 
 
 def build_workflow_summary_messages(
@@ -8094,6 +8559,19 @@ def main() -> int:
         MEMORY_DATABASE
     )
 
+    memory_review_settings = (
+        MemoryReviewSettings(
+            MEMORY_REVIEW_SETTINGS,
+            default_enabled=True,
+        )
+    )
+    memory_reviewer = MemoryReviewEngine(
+        memory_store=memory_store,
+        extract_candidate=(
+            extract_memory_candidate
+        ),
+    )
+
     document_store = DocumentStore(
         DOCUMENTS_DIRECTORY
     )
@@ -8133,7 +8611,7 @@ def main() -> int:
     history: list[dict[str, Any]] = []
 
     print("=" * 55)
-    print("Elise 1.1.0-dev3")
+    print("Elise 1.1.0-dev4.2")
     print(f"Local model: {MODEL_NAME}")
     print("Model runtime: Ollama")
     print(
@@ -8147,6 +8625,17 @@ def main() -> int:
     )
     print(
         "Relevant-memory retrieval: enabled"
+    )
+    print(
+        "Automatic memory review: "
+        + (
+            "enabled"
+            if memory_review_settings.is_enabled()
+            else "disabled"
+        )
+        + " "
+        + f"({memory_store.count_pending_suggestions()} pending; "
+        + "approval-gated)"
     )
     print(
         "Safe local tools: enabled "
@@ -8587,6 +9076,71 @@ def main() -> int:
             )
             continue
 
+        if (
+            lowered_input == "/memory-review"
+            or lowered_input.startswith(
+                "/memory-review "
+            )
+        ):
+            handle_memory_review_command(
+                user_input,
+                memory_review_settings,
+            )
+            continue
+
+        if (
+            lowered_input == "/memory-suggestions"
+            or lowered_input.startswith(
+                "/memory-suggestions "
+            )
+        ):
+            _, _, view = user_input.partition(
+                " "
+            )
+            cleaned_view = view.strip().lower()
+
+            if cleaned_view not in {
+                "",
+                "all",
+            }:
+                print(
+                    "Elise: Usage: /memory-suggestions [all]"
+                )
+                continue
+
+            print_memory_suggestions(
+                memory_store,
+                include_all=(
+                    cleaned_view
+                    == "all"
+                ),
+            )
+            continue
+
+        if (
+            lowered_input == "/approve-memory"
+            or lowered_input.startswith(
+                "/approve-memory "
+            )
+        ):
+            handle_approve_memory_command(
+                user_input,
+                memory_store,
+            )
+            continue
+
+        if (
+            lowered_input == "/reject-memory"
+            or lowered_input.startswith(
+                "/reject-memory "
+            )
+        ):
+            handle_reject_memory_command(
+                user_input,
+                memory_store,
+            )
+            continue
+
         if lowered_input.startswith(
             "/search-memories "
         ):
@@ -8673,6 +9227,56 @@ def main() -> int:
                 user_input=user_input,
                 memory_store=memory_store,
             )
+            continue
+
+        if is_likely_memory_declaration(
+            user_input
+        ):
+            history.append(
+                {
+                    "role": "user",
+                    "content": user_input,
+                }
+            )
+            assistant_message = (
+                build_memory_declaration_acknowledgment(
+                    user_input
+                )
+            )
+            print(
+                f"\nElise: {assistant_message}"
+            )
+            history.append(
+                {
+                    "role": "assistant",
+                    "content": assistant_message,
+                }
+            )
+
+            if memory_review_settings.is_enabled():
+                try:
+                    memory_outcome = (
+                        memory_reviewer.review(
+                            user_input
+                        )
+                    )
+                    print_automatic_memory_outcome(
+                        memory_store,
+                        memory_outcome,
+                    )
+                except (
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    json.JSONDecodeError,
+                ):
+                    pass
+                except (
+                    ConnectionError,
+                    ollama.ResponseError,
+                ):
+                    pass
+
             continue
 
         history.append(
@@ -8767,6 +9371,33 @@ def main() -> int:
                     "content": assistant_message,
                 }
             )
+
+            if memory_review_settings.is_enabled():
+                try:
+                    memory_outcome = (
+                        memory_reviewer.review(
+                            user_input
+                        )
+                    )
+                    print_automatic_memory_outcome(
+                        memory_store,
+                        memory_outcome,
+                    )
+                except (
+                    ValueError,
+                    TypeError,
+                    KeyError,
+                    json.JSONDecodeError,
+                ):
+                    # Memory review is advisory and must never break chat.
+                    pass
+                except (
+                    ConnectionError,
+                    ollama.ResponseError,
+                ):
+                    # The completed answer remains valid even if the optional
+                    # second model call for memory review is unavailable.
+                    pass
 
         except ConnectionError:
             print(
