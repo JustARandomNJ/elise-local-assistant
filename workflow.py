@@ -88,6 +88,7 @@ class WorkflowStep:
     action_name: str
     display_name: str
     arguments: dict[str, Any]
+    metadata: dict[str, Any]
     status: StepStatus
     requires_confirmation: bool
     result_summary: str | None
@@ -211,6 +212,7 @@ class WorkflowStore:
                     action_name TEXT NOT NULL,
                     display_name TEXT NOT NULL,
                     arguments_json TEXT NOT NULL,
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL,
                     requires_confirmation INTEGER NOT NULL,
                     result_summary TEXT,
@@ -255,6 +257,19 @@ class WorkflowStore:
                     );
                 """
             )
+
+            step_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(workflow_steps)"
+                ).fetchall()
+            }
+
+            if "metadata_json" not in step_columns:
+                connection.execute(
+                    "ALTER TABLE workflow_steps "
+                    "ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}'"
+                )
 
     @classmethod
     def _redact_value(
@@ -517,6 +532,23 @@ class WorkflowStore:
                 )
             }
 
+        try:
+            metadata = json.loads(
+                row[
+                    "metadata_json"
+                ]
+            )
+        except (
+            json.JSONDecodeError,
+            TypeError,
+            IndexError,
+        ):
+            metadata = {
+                "error": (
+                    "Stored metadata could not be decoded."
+                )
+            }
+
         return WorkflowStep(
             id=int(
                 row[
@@ -544,6 +576,7 @@ class WorkflowStore:
                 ]
             ),
             arguments=arguments,
+            metadata=metadata,
             status=StepStatus(
                 row[
                     "status"
@@ -887,6 +920,7 @@ class WorkflowStore:
                         action_name,
                         display_name,
                         arguments_json,
+                        metadata_json,
                         status,
                         requires_confirmation,
                         result_summary,
@@ -895,7 +929,7 @@ class WorkflowStore:
                         completed_at,
                         updated_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?)
+                    VALUES (?, ?, ?, ?, ?, '{}', ?, ?, NULL, NULL, NULL, NULL, ?)
                     """,
                     (
                         workflow_id,
@@ -1420,6 +1454,7 @@ class WorkflowStore:
         step_number: int,
         *,
         result_summary: str = "",
+        metadata: dict[str, Any] | None = None,
     ) -> WorkflowRun:
         workflow_id = int(
             workflow_id
@@ -1431,6 +1466,15 @@ class WorkflowStore:
         summary = self._truncate(
             result_summary.strip(),
             MAX_RESULT_SUMMARY_CHARS,
+        )
+        sanitized_metadata = self.sanitize_arguments(
+            metadata
+            or {}
+        )
+        metadata_json = json.dumps(
+            sanitized_metadata,
+            ensure_ascii=False,
+            sort_keys=True,
         )
 
         with self._connect() as connection:
@@ -1485,6 +1529,7 @@ class WorkflowStore:
                 UPDATE workflow_steps
                 SET status = ?,
                     result_summary = ?,
+                    metadata_json = ?,
                     error = NULL,
                     completed_at = ?,
                     updated_at = ?
@@ -1495,6 +1540,7 @@ class WorkflowStore:
                     StepStatus.COMPLETED.value,
                     summary
                     or None,
+                    metadata_json,
                     now,
                     now,
                     workflow_id,
