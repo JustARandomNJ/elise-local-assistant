@@ -21,7 +21,7 @@ from typing import Any, Callable
 import zlib
 
 
-SUITE_VERSION = "1.1.1"
+SUITE_VERSION = "1.2.0"
 DEFAULT_GROUPS = {
     "structure",
     "memory",
@@ -31,6 +31,7 @@ DEFAULT_GROUPS = {
     "internet",
     "app",
     "workflow",
+    "workflow-execution",
 }
 OPTIONAL_GROUPS = {
     "live-internet",
@@ -44,6 +45,7 @@ REQUIRED_PROJECT_FILES = {
     "audit.py",
     "internet.py",
     "workflow.py",
+    "workflow_execution.py",
 }
 
 
@@ -2133,6 +2135,329 @@ def check_workflow_store(
     )
 
 
+
+def check_workflow_execution(
+    project_root: Path,
+) -> str:
+    workflow_module = import_fresh(
+        "workflow"
+    )
+    execution_module = import_fresh(
+        "workflow_execution"
+    )
+    tools_module = import_fresh(
+        "tools"
+    )
+    audit_module = import_fresh(
+        "audit"
+    )
+
+    WorkflowStore = workflow_module.WorkflowStore
+    WorkflowStatus = workflow_module.WorkflowStatus
+    StepStatus = workflow_module.StepStatus
+    WorkflowExecutor = execution_module.WorkflowExecutor
+    ToolManager = tools_module.ToolManager
+    ToolAuditLog = audit_module.ToolAuditLog
+
+    class FakeDocumentStore:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def reindex(self) -> tuple[int, int]:
+            self.calls += 1
+            return 3, 5
+
+    with tempfile.TemporaryDirectory(
+        prefix="elise-regression-workflow-execution-",
+        ignore_cleanup_errors=True,
+    ) as temporary_directory:
+        temporary_root = Path(
+            temporary_directory
+        )
+        documents = (
+            temporary_root
+            / "documents"
+        )
+        data = temporary_root / "data"
+        documents.mkdir()
+        data.mkdir()
+        source = documents / "source.md"
+        source.write_text(
+            "Next tasks:\n- Build the parser.\n- Add regression tests.\n",
+            encoding="utf-8",
+        )
+
+        workflow_store = WorkflowStore(
+            data / "workflows.db"
+        )
+        tool_manager = ToolManager(
+            project_directory=temporary_root,
+            documents_directory=documents,
+        )
+        audit_log = ToolAuditLog(
+            data / "tool_audit.db"
+        )
+        document_store = FakeDocumentStore()
+        output: list[str] = []
+        previews: list[dict[str, Any]] = []
+        summary_text = (
+            "# Next Steps\n\n"
+            "- Build the parser.\n"
+            "- Add regression tests."
+        )
+
+        workflow = (
+            workflow_store
+            .create_read_summarize_write_workflow(
+                source_path="documents/source.md",
+                destination_path="documents/summary.md",
+            )
+        )
+        executor = WorkflowExecutor(
+            workflow_store=workflow_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=document_store,
+            summarize_source=(
+                lambda source_path, source_text: summary_text
+            ),
+            render_write_preview=(
+                lambda preview, policy: previews.append(
+                    preview
+                )
+            ),
+            request_confirmation=lambda: True,
+            output=output.append,
+        )
+        completed = executor.execute(
+            workflow.id
+        )
+        destination = documents / "summary.md"
+        require(
+            completed.status
+            is WorkflowStatus.COMPLETED,
+            "Approved workflow did not complete.",
+        )
+        require(
+            destination.read_text(
+                encoding="utf-8"
+            )
+            == summary_text + "\n",
+            "Approved workflow wrote unexpected content.",
+        )
+        require(
+            all(
+                step.status
+                is StepStatus.COMPLETED
+                for step in completed.steps
+            ),
+            "Approved workflow left incomplete steps.",
+        )
+        require(
+            len(previews) == 1,
+            "Approved workflow did not display exactly one preview.",
+        )
+        require(
+            document_store.calls == 1,
+            "Approved workflow did not reindex exactly once.",
+        )
+        require(
+            len(
+                completed.steps[1].metadata.get(
+                    "source_sha256",
+                    "",
+                )
+            )
+            == 64,
+            "Source hash metadata was not persisted.",
+        )
+        require(
+            len(
+                completed.steps[3].metadata.get(
+                    "content_sha256",
+                    "",
+                )
+            )
+            == 64,
+            "Preview hash metadata was not persisted.",
+        )
+        require(
+            audit_log.count() >= 3,
+            "Workflow tool executions were not audited.",
+        )
+
+        denied = (
+            workflow_store
+            .create_read_summarize_write_workflow(
+                source_path="documents/source.md",
+                destination_path="documents/denied.md",
+            )
+        )
+        denied_executor = WorkflowExecutor(
+            workflow_store=workflow_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=FakeDocumentStore(),
+            summarize_source=(
+                lambda source_path, source_text: "# Next Steps\n\n- Denied."
+            ),
+            render_write_preview=(
+                lambda preview, policy: None
+            ),
+            request_confirmation=lambda: False,
+            output=lambda message: None,
+        )
+        denied_result = denied_executor.execute(
+            denied.id
+        )
+        require(
+            denied_result.status
+            is WorkflowStatus.CANCELLED,
+            "Denied workflow did not cancel.",
+        )
+        require(
+            not (
+                documents
+                / "denied.md"
+            ).exists(),
+            "Denied workflow wrote a file.",
+        )
+
+        interrupted = (
+            workflow_store
+            .create_read_summarize_write_workflow(
+                source_path="documents/source.md",
+                destination_path="documents/resumed.md",
+            )
+        )
+
+        def interrupt_confirmation() -> bool:
+            raise KeyboardInterrupt()
+
+        interrupted_executor = WorkflowExecutor(
+            workflow_store=workflow_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=FakeDocumentStore(),
+            summarize_source=(
+                lambda source_path, source_text: "# Next Steps\n\n- Resume safely."
+            ),
+            render_write_preview=(
+                lambda preview, policy: None
+            ),
+            request_confirmation=interrupt_confirmation,
+            output=lambda message: None,
+        )
+        paused = interrupted_executor.execute(
+            interrupted.id
+        )
+        require(
+            paused.status
+            is WorkflowStatus.WAITING_FOR_CONFIRMATION,
+            "Interrupted workflow did not remain paused.",
+        )
+
+        reopened_store = WorkflowStore(
+            data / "workflows.db"
+        )
+        resumed_executor = WorkflowExecutor(
+            workflow_store=reopened_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=FakeDocumentStore(),
+            summarize_source=(
+                lambda source_path, source_text: "# Next Steps\n\n- Resume safely."
+            ),
+            render_write_preview=(
+                lambda preview, policy: None
+            ),
+            request_confirmation=lambda: True,
+            output=lambda message: None,
+        )
+        resumed = resumed_executor.execute(
+            interrupted.id
+        )
+        require(
+            resumed.status
+            is WorkflowStatus.COMPLETED,
+            "Interrupted workflow did not resume after reopening.",
+        )
+        require(
+            (
+                documents
+                / "resumed.md"
+            ).exists(),
+            "Resumed workflow did not write its approved file.",
+        )
+
+        changed = (
+            workflow_store
+            .create_read_summarize_write_workflow(
+                source_path="documents/source.md",
+                destination_path="documents/changed.md",
+            )
+        )
+        changed_executor = WorkflowExecutor(
+            workflow_store=workflow_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=FakeDocumentStore(),
+            summarize_source=(
+                lambda source_path, source_text: "# Next Steps\n\n- Stable preview."
+            ),
+            render_write_preview=(
+                lambda preview, policy: None
+            ),
+            request_confirmation=interrupt_confirmation,
+            output=lambda message: None,
+        )
+        changed_paused = changed_executor.execute(
+            changed.id
+        )
+        require(
+            changed_paused.status
+            is WorkflowStatus.WAITING_FOR_CONFIRMATION,
+            "Source-change fixture did not pause.",
+        )
+        source.write_text(
+            "Next tasks:\n- Source changed after preview.\n",
+            encoding="utf-8",
+        )
+        changed_resume = WorkflowExecutor(
+            workflow_store=workflow_store,
+            tool_manager=tool_manager,
+            audit_log=audit_log,
+            document_store=FakeDocumentStore(),
+            summarize_source=(
+                lambda source_path, source_text: "# Next Steps\n\n- Stable preview."
+            ),
+            render_write_preview=(
+                lambda preview, policy: None
+            ),
+            request_confirmation=lambda: True,
+            output=lambda message: None,
+        ).execute(
+            changed.id
+        )
+        require(
+            changed_resume.status
+            is WorkflowStatus.FAILED,
+            "Changed source did not fail closed on resume.",
+        )
+        require(
+            not (
+                documents
+                / "changed.md"
+            ).exists(),
+            "Changed-source workflow wrote a file.",
+        )
+
+    return (
+        "Approved execution, denial, audited writes, metadata-only "
+        "persistence, restart resume, and source-change fail-closed passed"
+    )
+
+
 def check_app_pure_functions(
     project_root: Path,
 ) -> str:
@@ -2453,7 +2778,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Run selected groups only. Repeat the option or use commas. "
             "Groups: structure, memory, documents, tools, audit, internet, "
-            "workflow, app, live-internet, live-model."
+            "workflow, workflow-execution, app, live-internet, live-model."
         ),
     )
     parser.add_argument(
@@ -2631,6 +2956,13 @@ def main() -> int:
         "workflow",
         "persistent workflow state machine",
         lambda: check_workflow_store(
+            project_root
+        ),
+    )
+    runner.run(
+        "workflow-execution",
+        "safe read-summarize-confirm-write execution",
+        lambda: check_workflow_execution(
             project_root
         ),
     )
