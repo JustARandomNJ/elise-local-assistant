@@ -1,3 +1,4 @@
 # Imported by app.py during the offline regression suite.
 # The Ollama server and model are not started in GitHub Actions.
 ollama==0.6.2
+cryptography==46.0.4

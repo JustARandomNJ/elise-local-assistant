@@ -126,6 +126,9 @@ class MemoryReviewOutcome:
     related_memory_id: int | None = None
     reason: str | None = None
     detail: str | None = None
+    privacy_level: str | None = None
+    retrieval_policy: str | None = None
+    expires_at: str | None = None
 
 
 class MemoryReviewSettings:
@@ -1035,6 +1038,12 @@ class MemoryReviewEngine:
                 "new",
             )
         ).strip().lower()
+        # Automatic review is ordinary-only. Reviewed profile imports may
+        # explicitly stage personal memories through the same engine.
+        privacy_level = str(candidate.get("privacy_level", "ordinary")).strip().lower()
+        retrieval_policy = str(candidate.get("retrieval_policy", "when_relevant")).strip().lower()
+        expires_at_value = candidate.get("expires_at")
+        expires_at = None if expires_at_value is None else str(expires_at_value)
 
         try:
             confidence = float(
@@ -1118,6 +1127,10 @@ class MemoryReviewEngine:
 
         if relation not in ALLOWED_RELATIONS:
             relation = "new"
+        if privacy_level not in {"ordinary", "personal"}:
+            return MemoryReviewOutcome(status="rejected", detail="invalid_privacy_level")
+        if retrieval_policy not in {"when_relevant", "explicit_only", "never_prompt"}:
+            return MemoryReviewOutcome(status="rejected", detail="invalid_retrieval_policy")
 
         if not reason:
             reason = (
@@ -1240,6 +1253,9 @@ class MemoryReviewEngine:
                 ),
                 reason=reason,
                 source_hash=source_hash,
+                privacy_level=privacy_level,
+                retrieval_policy=retrieval_policy,
+                expires_at=expires_at,
             )
         )
 
@@ -1269,6 +1285,9 @@ class MemoryReviewEngine:
                 related_memory_id
             ),
             reason=reason,
+            privacy_level=privacy_level,
+            retrieval_policy=retrieval_policy,
+            expires_at=expires_at,
         )
 
 def is_likely_memory_declaration(
