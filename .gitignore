@@ -44,3 +44,6 @@ regression_reports/
 
 # Temporary regression artifacts
 elise-regression-*/
+
+# Private local memory profiles
+profiles/*.json
