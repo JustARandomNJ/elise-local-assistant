@@ -21,11 +21,12 @@ from typing import Any, Callable
 import zlib
 
 
-SUITE_VERSION = "1.4.2"
+SUITE_VERSION = "1.5.1"
 DEFAULT_GROUPS = {
     "structure",
     "memory",
     "memory-review",
+    "profile-import",
     "documents",
     "tools",
     "audit",
@@ -43,6 +44,7 @@ REQUIRED_PROJECT_FILES = {
     "app.py",
     "memory.py",
     "memory_review.py",
+    "profile_import.py",
     "document_search.py",
     "tools.py",
     "audit.py",
@@ -1326,6 +1328,348 @@ def check_memory_review(
         "Conservative extraction, raw-message hashing, pending persistence, "
         "approval, conflict replacement, rejection, duplicate detection, "
         "sensitive/transient filtering, and settings persistence passed"
+    )
+
+
+
+def check_profile_import(
+    project_root: Path,
+) -> str:
+    memory_module = import_project_module(
+        project_root,
+        "memory",
+    )
+    review_module = import_project_module(
+        project_root,
+        "memory_review",
+    )
+    profile_module = import_project_module(
+        project_root,
+        "profile_import",
+    )
+
+    with tempfile.TemporaryDirectory(
+        prefix="elise-profile-import-test-",
+    ) as temporary_directory:
+        temporary_path = Path(
+            temporary_directory
+        )
+        database_path = (
+            temporary_path
+            / "memory.db"
+        )
+        profile_path = (
+            temporary_path
+            / "profile.json"
+        )
+
+        store = memory_module.MemoryStore(
+            database_path
+        )
+        require(
+            store.add(
+                content=(
+                    "User prefers direct, practical feedback."
+                ),
+                category="preference",
+                confidence=1.0,
+                source="regression",
+            )
+            is True,
+            "Could not seed existing profile-import memory.",
+        )
+        existing_memory = (
+            store.list_all(
+                "preference"
+            )[
+                0
+            ]
+        )
+        existing_id = int(
+            row_value(
+                existing_memory,
+                "id",
+            )
+        )
+
+        profile_payload = {
+            "schema_version": 1,
+            "profile_name": (
+                "Regression reviewed profile"
+            ),
+            "description": (
+                "A safe profile import test."
+            ),
+            "memories": [
+                {
+                    "content": (
+                        "User prefers direct and practical feedback."
+                    ),
+                    "category": "preference",
+                    "confidence": 0.98,
+                    "include": True,
+                    "note": (
+                        "Expected duplicate."
+                    ),
+                },
+                {
+                    "content": (
+                        "User prefers complete replacement files instead of patch diffs."
+                    ),
+                    "category": "preference",
+                    "confidence": 0.96,
+                    "include": True,
+                },
+                {
+                    "content": (
+                        "User prefers indirect and theoretical feedback."
+                    ),
+                    "category": "preference",
+                    "confidence": 0.95,
+                    "include": True,
+                },
+                {
+                    "content": (
+                        "User has a medical diagnosis that should be remembered."
+                    ),
+                    "category": "fact",
+                    "confidence": 0.99,
+                    "include": True,
+                },
+                {
+                    "content": (
+                        "User uses an intentionally excluded test preference."
+                    ),
+                    "category": "preference",
+                    "confidence": 0.95,
+                    "include": False,
+                },
+            ],
+        }
+        profile_path.write_text(
+            json.dumps(
+                profile_payload,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        profile = profile_module.load_profile(
+            profile_path
+        )
+        require(
+            profile.profile_name
+            == "Regression reviewed profile",
+            "Profile name was not loaded.",
+        )
+        require(
+            len(
+                profile.items
+            )
+            == 5,
+            "Profile item count was incorrect.",
+        )
+
+        def classifier(
+            item: Any,
+            existing_memories: list[
+                dict[str, Any]
+            ],
+        ) -> dict[str, Any]:
+            if "indirect and theoretical" in item.content:
+                return {
+                    "relation": "conflict",
+                    "related_memory_id": existing_id,
+                    "reason": (
+                        "This replaces the existing response-style preference."
+                    ),
+                }
+
+            if "complete replacement" in item.content:
+                return {
+                    "relation": "new",
+                    "related_memory_id": None,
+                    "reason": (
+                        "This is a distinct workflow preference."
+                    ),
+                }
+
+            return {
+                "relation": "duplicate",
+                "related_memory_id": existing_id,
+                "reason": (
+                    "This is equivalent to confirmed memory."
+                ),
+            }
+
+        engine = profile_module.ProfileImportEngine(
+            memory_store=store,
+            classify_relation=classifier,
+        )
+        preview = engine.preview(
+            profile
+        )
+        require(
+            len(
+                preview
+            )
+            == 5,
+            "Profile preview omitted items.",
+        )
+        confirmed_before = len(
+            store.list_all()
+        )
+        report = engine.stage(
+            profile
+        )
+        confirmed_after = len(
+            store.list_all()
+        )
+
+        require(
+            confirmed_before
+            == confirmed_after,
+            "Profile import wrote directly to confirmed memory.",
+        )
+        require(
+            report.staged == 2,
+            "Expected one new and one conflict suggestion.",
+        )
+        require(
+            report.duplicates == 1,
+            "Expected one duplicate profile item.",
+        )
+        require(
+            report.blocked == 1,
+            "Sensitive profile item was not blocked.",
+        )
+        require(
+            report.skipped == 1,
+            "Excluded profile item was not skipped.",
+        )
+
+        staged_rows = [
+            result
+            for result in report.results
+            if result.status == "staged"
+        ]
+        require(
+            len(
+                staged_rows
+            )
+            == 2,
+            "Staged profile result count was incorrect.",
+        )
+        conflict_rows = [
+            result
+            for result in staged_rows
+            if result.relation
+            == "conflict"
+        ]
+        require(
+            len(
+                conflict_rows
+            )
+            == 1
+            and conflict_rows[
+                0
+            ].related_memory_id
+            == existing_id,
+            "Profile conflict target was not preserved.",
+        )
+
+        new_row = next(
+            result
+            for result in staged_rows
+            if result.relation
+            == "new"
+        )
+        approval = store.approve_suggestion(
+            int(
+                new_row.suggestion_id
+            )
+        )
+        require(
+            bool(
+                approval.get(
+                    "success"
+                )
+            )
+            is True,
+            "Profile suggestion could not be approved.",
+        )
+        require(
+            len(
+                store.list_all()
+            )
+            == confirmed_after
+            + 1,
+            "Approved profile suggestion did not create confirmed memory.",
+        )
+
+        # Every MemoryStore call must have closed its short-lived
+        # connection. Renaming while the store object is still alive catches
+        # open SQLite handles on Windows.
+        moved_database_path = (
+            temporary_path
+            / "memory-moved.db"
+        )
+        database_path.replace(
+            moved_database_path
+        )
+        moved_database_path.replace(
+            database_path
+        )
+
+        app_source = (
+            project_root
+            / "app.py"
+        ).read_text(
+            encoding="utf-8"
+        )
+        require(
+            'f"\\\\nProfile preview:' not in app_source,
+            "Profile preview still prints a literal backslash-n marker.",
+        )
+        require(
+            'f"\\\\nProfile staged:' not in app_source,
+            "Profile staging report still prints a literal backslash-n marker.",
+        )
+
+        malformed_path = (
+            temporary_path
+            / "malformed.json"
+        )
+        malformed_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 99,
+                    "profile_name": "Bad",
+                    "memories": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            profile_module.load_profile(
+                malformed_path
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "Unsupported profile schema was accepted."
+            )
+
+        release_resource(
+            store
+        )
+
+    return (
+        "Strict schema, preview-only behavior, duplicate detection, "
+        "host-validated conflict staging, sensitive filtering, exclusions, "
+        "approval-gated confirmation, Windows-safe SQLite closure, and clean ""console formatting passed"
     )
 
 
@@ -3994,6 +4338,13 @@ def main() -> int:
         "memory-review",
         "approval-gated automatic memory suggestions",
         lambda: check_memory_review(
+            project_root
+        ),
+    )
+    runner.run(
+        "profile-import",
+        "review-staged memory profile migration",
+        lambda: check_profile_import(
             project_root
         ),
     )
