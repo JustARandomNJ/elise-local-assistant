@@ -30,6 +30,9 @@ class ProfileMemoryItem:
     confidence: float
     include: bool
     note: str
+    privacy_level: str
+    retrieval_policy: str
+    expires_at: str | None
 
 
 @dataclass(frozen=True)
@@ -121,6 +124,10 @@ def _validate_profile_item(
         "include",
         True,
     )
+    privacy_level = _normalize_line(raw_item.get("privacy_level", "ordinary")).lower()
+    retrieval_policy = _normalize_line(raw_item.get("retrieval_policy", "when_relevant")).lower()
+    raw_expiration = raw_item.get("expires_at")
+    expires_at = None if raw_expiration in {None, "", "never"} else _normalize_line(raw_expiration)
 
     if not isinstance(
         include,
@@ -183,6 +190,12 @@ def _validate_profile_item(
             f"{MIN_PROFILE_CONFIDENCE:.2f} and 1.00."
         )
 
+    if privacy_level not in {"ordinary", "personal", "sensitive"}:
+        raise ValueError(f"Profile item {index} privacy_level must be ordinary, personal, or sensitive.")
+    allowed_policies = {"explicit_only", "never_prompt"} if privacy_level == "sensitive" else {"when_relevant", "explicit_only", "never_prompt"}
+    if retrieval_policy not in allowed_policies:
+        raise ValueError(f"Profile item {index} has an invalid retrieval_policy for {privacy_level} memory.")
+
     if len(
         note
     ) > MAX_PROFILE_NOTE_CHARS:
@@ -198,6 +211,9 @@ def _validate_profile_item(
         confidence=confidence,
         include=include,
         note=note,
+        privacy_level=privacy_level,
+        retrieval_policy=retrieval_policy,
+        expires_at=expires_at,
     )
 
 
@@ -650,6 +666,18 @@ class ProfileImportEngine:
                 )
                 continue
 
+            if item.privacy_level == "sensitive":
+                results.append(
+                    ProfileItemResult(
+                        index=item.index,
+                        content=item.content,
+                        category=item.category,
+                        status="blocked",
+                        detail="Sensitive profile items are manual-only and must use the encrypted private-memory vault.",
+                    )
+                )
+                continue
+
             source_text = (
                 "I am reviewing a durable profile memory candidate: "
                 + item.content
@@ -764,6 +792,19 @@ class ProfileImportEngine:
 
             included_items += 1
 
+            if item.privacy_level == "sensitive":
+                blocked += 1
+                results.append(
+                    ProfileItemResult(
+                        index=item.index,
+                        content=item.content,
+                        category=item.category,
+                        status="blocked",
+                        detail="Sensitive profile items are manual-only and must use the encrypted private-memory vault.",
+                    )
+                )
+                continue
+
             classification = {
                 "relation": "new",
                 "related_memory_id": None,
@@ -843,6 +884,9 @@ class ProfileImportEngine:
                 "related_memory_id": (
                     related_memory_id
                 ),
+                "privacy_level": item.privacy_level,
+                "retrieval_policy": item.retrieval_policy,
+                "expires_at": item.expires_at,
             }
 
             reviewer = MemoryReviewEngine(

@@ -21,12 +21,13 @@ from typing import Any, Callable
 import zlib
 
 
-SUITE_VERSION = "1.5.1"
+SUITE_VERSION = "1.6.0"
 DEFAULT_GROUPS = {
     "structure",
     "memory",
     "memory-review",
     "profile-import",
+    "private-memory",
     "documents",
     "tools",
     "audit",
@@ -45,6 +46,7 @@ REQUIRED_PROJECT_FILES = {
     "memory.py",
     "memory_review.py",
     "profile_import.py",
+    "private_memory.py",
     "document_search.py",
     "tools.py",
     "audit.py",
@@ -1671,6 +1673,69 @@ def check_profile_import(
         "host-validated conflict staging, sensitive filtering, exclusions, "
         "approval-gated confirmation, Windows-safe SQLite closure, and clean ""console formatting passed"
     )
+
+
+
+def check_private_memory_controls(project_root: Path) -> str:
+    memory_module = import_project_module(project_root, "memory")
+    private_module = import_project_module(project_root, "private_memory")
+    with tempfile.TemporaryDirectory(prefix="elise-private-memory-test-") as temporary_directory:
+        root = Path(temporary_directory)
+        store = memory_module.MemoryStore(root / "memory.db")
+        require(store.add(content="User likes embedded firmware.", category="preference", privacy_level="ordinary", retrieval_policy="when_relevant"), "Could not add ordinary memory.")
+        require(store.add(content="User has a personal communication preference.", category="preference", privacy_level="personal", retrieval_policy="when_relevant"), "Could not add personal memory.")
+        require(store.add(content="User has an explicit private career note.", category="fact", privacy_level="personal", retrieval_policy="explicit_only"), "Could not add explicit-only memory.")
+        require(store.add(content="User has a hidden personal note.", category="fact", privacy_level="personal", retrieval_policy="never_prompt"), "Could not add never-prompt memory.")
+        require(store.add(content="User has an expired firmware memory.", category="fact", privacy_level="ordinary", retrieval_policy="when_relevant", expires_at="2000-01-01"), "Could not add expired memory.")
+        automatic = store.search("embedded communication career", top_k=10, explicit=False, retrieval_context="automatic_chat")
+        automatic_text = " ".join(str(row["content"]) for row in automatic)
+        require("embedded firmware" in automatic_text and "communication preference" in automatic_text, "Automatic search omitted eligible ordinary or personal memory.")
+        require("explicit private career" not in automatic_text and "hidden personal" not in automatic_text and "expired" not in automatic_text, "Automatic search ignored policy or expiration.")
+        explicit = store.search("private career", top_k=10, explicit=True, retrieval_context="explicit_search")
+        require(any("explicit private career" in str(row["content"]) for row in explicit), "Explicit search omitted explicit-only memory.")
+        require(all("hidden personal" not in str(row["content"]) for row in explicit), "Never-prompt memory was retrieved.")
+        logs = store.recent_retrievals(20)
+        require(bool(logs), "Retrieval log was not created.")
+        require(all(len(str(row["query_hash"])) == 64 for row in logs), "Retrieval log did not store query hashes.")
+        require(all("private career" not in str(row["reason"]) for row in logs), "Retrieval log leaked the raw query in its reason.")
+        first = store.list_all()[0]
+        first_id = int(first["id"])
+        require(store.set_retrieval_policy(first_id, "explicit_only"), "Could not update retrieval policy.")
+        require(store.set_expiration(first_id, "2099-12-31"), "Could not update expiration.")
+        updated = store.get(first_id)
+        require(str(updated["retrieval_policy"]) == "explicit_only" and updated["expires_at"] is not None, "Memory privacy metadata update failed.")
+
+        vault = private_module.PrivateMemoryVault(root / "private.enc", root / "private.salt")
+        require(vault.is_unlocked is False, "Vault started unlocked.")
+        vault.unlock("correct horse battery staple")
+        private_id = vault.add(content="Sensitive relationship context for explicit use.", category="observation", retrieval_policy="explicit_only")
+        require(private_id == "S1", "Unexpected private-memory ID.")
+        encrypted_bytes = (root / "private.enc").read_bytes()
+        require(b"Sensitive relationship" not in encrypted_bytes, "Sensitive memory was stored in plaintext.")
+        matches = vault.search("relationship context")
+        require(len(matches) == 1 and matches[0]["id"] == "S1", "Explicit private search failed.")
+        vault.lock()
+        try:
+            vault.list_all()
+        except private_module.PrivateMemoryLockedError:
+            pass
+        else:
+            raise AssertionError("Locked vault exposed sensitive memory.")
+        try:
+            vault.unlock("incorrect passphrase")
+        except private_module.PrivateMemoryError:
+            pass
+        else:
+            raise AssertionError("Wrong passphrase unlocked the vault.")
+        vault.unlock("correct horse battery staple")
+        require(vault.set_policy("S1", "never_prompt"), "Could not set private policy.")
+        require(vault.search("relationship context") == [], "Never-prompt sensitive memory appeared in search.")
+        require(vault.update("S1", content="Updated sensitive context."), "Could not edit sensitive memory.")
+        require(vault.set_expiration("S1", "2099-12-31"), "Could not set sensitive expiration.")
+        require(vault.delete("S1"), "Could not permanently delete sensitive memory.")
+        require(vault.get("S1") is None, "Deleted sensitive memory remained in vault.")
+        release_resource(store)
+    return "Ordinary/personal retrieval policies, expiration, retrieval explanations, hashed-query logs, passphrase encryption, vault locking, editing, and deletion passed"
 
 
 def check_document_store(
@@ -4345,6 +4410,13 @@ def main() -> int:
         "profile-import",
         "review-staged memory profile migration",
         lambda: check_profile_import(
+            project_root
+        ),
+    )
+    runner.run(
+        "private-memory",
+        "privacy policies and encrypted sensitive-memory vault",
+        lambda: check_private_memory_controls(
             project_root
         ),
     )
