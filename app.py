@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import atexit
 import getpass
 import hashlib
 import json
@@ -39,6 +40,7 @@ from memory_review import (
     build_memory_review_messages,
     is_likely_memory_declaration,
 )
+from media_commands import MediaCommandService
 from profile_import import (
     ProfileDocument,
     ProfileImportEngine,
@@ -65,6 +67,8 @@ MEMORY_REVIEW_SETTINGS = BASE_DIRECTORY / "data" / "memory_review_settings.json"
 TOOL_AUDIT_DATABASE = BASE_DIRECTORY / "data" / "tool_audit.db"
 INTERNET_SETTINGS = BASE_DIRECTORY / "data" / "internet_settings.json"
 WORKFLOW_DATABASE = BASE_DIRECTORY / "data" / "workflows.db"
+MEDIA_DISPLAY_SETTINGS = BASE_DIRECTORY / "data" / "media_display_settings.json"
+DISPLAY_ASSETS_DIRECTORY = BASE_DIRECTORY / "display_assets"
 DOCUMENTS_DIRECTORY = BASE_DIRECTORY / "documents"
 PRIVATE_MEMORY_VAULT = BASE_DIRECTORY / "data" / "private_memories.enc"
 PRIVATE_MEMORY_SALT = BASE_DIRECTORY / "data" / "private_memory.salt"
@@ -945,6 +949,16 @@ def print_help() -> None:
         "\n"
         "  /fetch-url <https://...>\n"
         "      Fetch bounded readable text from one public page.\n"
+        "\n"
+        "  /play-latest <creator>\n"
+        "      Display the newest eligible upload from a saved or resolved YouTube creator.\n"
+        "  /creator-select <number> | /creator-cancel\n"
+        "      Confirm or cancel a pending YouTube channel discovery.\n"
+        "  /creator aliases | /creator forget <alias>\n"
+        "      List or remove locally saved creator aliases.\n"
+        "\n"
+        "  /display pause|resume|close|status\n"
+        "      Control or inspect the separate local media-display window.\n"
         "\n"
         "  /time\n"
         "      Show the host computer's current local time.\n"
@@ -9093,6 +9107,14 @@ def main() -> int:
         TOOL_AUDIT_DATABASE
     )
 
+    media_commands = MediaCommandService(
+        config_path=MEDIA_DISPLAY_SETTINGS,
+        assets_directory=DISPLAY_ASSETS_DIRECTORY,
+        internet_manager=internet_manager,
+        audit_log=audit_log,
+    )
+    atexit.register(media_commands.shutdown)
+
     workflow_store = WorkflowStore(
         WORKFLOW_DATABASE
     )
@@ -9449,6 +9471,11 @@ def main() -> int:
                 user_input,
                 internet_manager,
             )
+            continue
+
+        media_response = media_commands.handle_command(user_input)
+        if media_response is not None:
+            print(media_response)
             continue
 
         if (

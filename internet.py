@@ -34,6 +34,7 @@ DEFAULT_TIMEOUT_SECONDS = 10
 MAX_TIMEOUT_SECONDS = 20
 MAX_RESPONSE_BYTES = 1_500_000
 MAX_COMPRESSED_RESPONSE_BYTES = 1_500_000
+MAX_PROVIDER_ERROR_BYTES = 65_536
 DECOMPRESSION_CHUNK_BYTES = 64_000
 DEFAULT_PAGE_CHARS = 6_000
 MAX_PAGE_CHARS = 30_000
@@ -361,6 +362,50 @@ AUTHORITY_DOMAIN_HINTS = {
 
 class InternetError(Exception):
     """Raised when a network request is invalid, unsafe, or unavailable."""
+
+
+class ProviderHTTPError(InternetError):
+    """A sanitized HTTP failure from a deterministic JSON provider."""
+
+    def __init__(self, status: int, reason: str | None = None) -> None:
+        super().__init__(f"The provider returned HTTP {status}.")
+        self.status = status
+        self.reason = reason
+
+
+def _google_error_reason(body: bytes, charset: str = "utf-8") -> str | None:
+    """Extract only Google's bounded, non-secret machine-readable reason."""
+
+    try:
+        payload = json.loads(body.decode(charset, errors="replace"))
+    except (UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    errors = error.get("errors") if isinstance(error, dict) else None
+    first = errors[0] if isinstance(errors, list) and errors else None
+    reason = first.get("reason") if isinstance(first, dict) else None
+    if not isinstance(reason, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", reason):
+        return None
+    return reason
+
+
+def _provider_failure(status: int, reason: str | None) -> dict[str, Any]:
+    """Normalize provider failures without retaining URLs, bodies, or headers."""
+
+    normalized = reason.casefold() if reason else ""
+    if normalized == "channelnotfound":
+        code, message = "channel_not_found", "No exact YouTube handle matched."
+    elif normalized in {"quotaexceeded", "dailylimitexceeded"}:
+        code, message = "quota_exceeded", "YouTube API quota is unavailable."
+    elif normalized in {"keyinvalid", "accessnotconfigured"}:
+        code, message = "api_configuration_error", "YouTube API configuration is invalid or unavailable."
+    elif normalized in {"invalidcriteria", "invalidparameter"}:
+        code, message = "provider_request_error", "YouTube rejected the provider request."
+    elif status >= 500:
+        code, message = "provider_unavailable", "YouTube is temporarily unavailable."
+    else:
+        code, message = "provider_http_error", "YouTube returned an HTTP error."
+    return {"success": False, "status": status, "provider_reason": reason, "error_code": code, "error": message}
 
 
 class _SafeRedirectHandler(HTTPRedirectHandler):
@@ -2894,8 +2939,18 @@ class InternetManager:
                 )
 
         except HTTPError as error:
-            raise InternetError(
-                f"The server returned HTTP {error.code}."
+            # HTTPError is also a response object. Read only a bounded body and
+            # retain only Google's safe machine-readable reason.
+            try:
+                error_body = error.read(MAX_PROVIDER_ERROR_BYTES + 1)
+            except (OSError, ValueError):
+                error_body = b""
+            if len(error_body) > MAX_PROVIDER_ERROR_BYTES:
+                error_body = b""
+            charset = error.headers.get_content_charset() if error.headers is not None else None
+            raise ProviderHTTPError(
+                int(error.code),
+                _google_error_reason(error_body, charset or "utf-8"),
             ) from error
         except URLError as error:
             reason = getattr(
@@ -3663,3 +3718,58 @@ class InternetManager:
                 "fetched_at"
             ],
         }
+
+    def fetch_public_json(
+        self,
+        url: str,
+    ) -> dict[str, Any]:
+        """Fetch bounded public JSON for a deterministic host provider.
+
+        This method is deliberately not a model tool. Its response never
+        echoes the request URL, which can contain a provider credential.
+        """
+
+        if not self._enabled:
+            return {
+                "success": False,
+                "error_code": "internet_disabled",
+                "error": "Internet access is disabled. Use `/internet on` to enable it.",
+            }
+
+        try:
+            response = self._open_public_url(
+                url,
+                accept="application/json,text/json;q=0.9,*/*;q=0.1",
+            )
+        except ProviderHTTPError as error:
+            return _provider_failure(error.status, error.reason)
+        except InternetError as error:
+            return {
+                "success": False,
+                "error_code": "network_error",
+                "error": str(error),
+            }
+
+        if str(response["content_type"]).lower() not in {"application/json", "text/json"}:
+            return {
+                "success": False,
+                "error_code": "unsupported_content_type",
+                "error": "The provider did not return JSON.",
+            }
+        try:
+            payload = json.loads(
+                self._decode_body(response["body"], response["charset"])
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {
+                "success": False,
+                "error_code": "invalid_json",
+                "error": "The provider returned invalid JSON.",
+            }
+        if not isinstance(payload, dict):
+            return {
+                "success": False,
+                "error_code": "invalid_json",
+                "error": "The provider returned an unexpected JSON payload.",
+            }
+        return {"success": True, "data": payload}

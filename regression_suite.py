@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from email.message import Message
 import gc
 import gzip
 import importlib
+import io
 import json
 import os
 from pathlib import Path
@@ -18,6 +20,9 @@ import tempfile
 import time
 import traceback
 from typing import Any, Callable
+from urllib.parse import parse_qs, urlsplit
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
 import zlib
 
 
@@ -32,6 +37,7 @@ DEFAULT_GROUPS = {
     "tools",
     "audit",
     "internet",
+    "media-display",
     "app",
     "workflow",
     "workflow-execution",
@@ -53,6 +59,11 @@ REQUIRED_PROJECT_FILES = {
     "internet.py",
     "workflow.py",
     "workflow_execution.py",
+    "media_models.py",
+    "media_config.py",
+    "media_providers.py",
+    "media_display.py",
+    "media_commands.py",
 }
 
 
@@ -2700,6 +2711,393 @@ def check_internet_manager(
     )
 
 
+def check_media_display(project_root: Path) -> str:
+    """Run Media Display checks with mocked provider and browser boundaries."""
+
+    config_module = import_fresh("media_config")
+    providers_module = import_fresh("media_providers")
+    internet_module = import_fresh("internet")
+    display_module = import_fresh("media_display")
+    commands_module = import_fresh("media_commands")
+    audit_module = import_fresh("audit")
+
+    with tempfile.TemporaryDirectory(prefix="elise-regression-media-") as temporary_directory:
+        root = Path(temporary_directory)
+        config_path = root / "media_display_settings.json"
+        config_path.write_text(json.dumps({
+            "version": 1,
+            "youtube": {"creator_aliases": {"Markiplier": {"channel_id": "UC" + "a" * 22}}},
+            "display": {"fullscreen": False},
+        }), encoding="utf-8")
+        config = config_module.MediaDisplayConfig.load(config_path)
+        creator = config.resolve_creator("  markiplier ")
+        require(creator is not None, "Configured creator alias did not resolve.")
+
+        class AdapterInternet(internet_module.InternetManager):
+            def __init__(self, outcomes: list[object]) -> None:
+                self._enabled = True
+                self.outcomes = outcomes
+
+            def _open_public_url(self, url: str, *, accept: str, timeout_seconds: int = 15) -> dict[str, Any]:
+                outcome = self.outcomes.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return {"body": json.dumps(outcome).encode("utf-8"), "status": 200, "content_type": "application/json", "charset": "utf-8"}
+
+        adapter = AdapterInternet([{"items": []}])
+        adapter_result = adapter.fetch_public_json("https://www.googleapis.com/youtube/v3/channels?key=SECRET")
+        require(adapter_result == {"success": True, "data": {"items": []}}, "Production JSON adapter contract changed or lost top-level Google items.")
+        adapter_provider = providers_module.YouTubeDataProvider(api_key="SECRET", json_fetcher=AdapterInternet([{"items": []}]).fetch_public_json)
+        require(adapter_provider.resolve_exact_handle("@missing").error_code == "channel_not_found", "Adapter-backed empty channels response was not parsed.")
+
+        adapter_channel_id = "UC" + "z" * 22
+        search_adapter = AdapterInternet([
+            {"items": [{"id": {"channelId": adapter_channel_id}, "snippet": {"channelId": adapter_channel_id}}]},
+            {"items": [{"id": adapter_channel_id, "snippet": {"title": "Adapter Candidate", "description": "candidate"}, "statistics": {}}]},
+        ])
+        adapter_search = providers_module.YouTubeDataProvider(api_key="SECRET", json_fetcher=search_adapter.fetch_public_json).discover_channels("adapter candidate")
+        require(len(adapter_search.candidates) == 1 and adapter_search.candidates[0].channel_id == adapter_channel_id, "Adapter-backed search candidates were not parsed.")
+
+        google_error = lambda reason, status=403: internet_module.ProviderHTTPError(
+            status,
+            internet_module._google_error_reason(json.dumps({"error": {"message": "unsafe provider detail", "errors": [{"reason": reason}]}}).encode("utf-8")),
+        )
+        for reason, expected_code in (("channelNotFound", "channel_not_found"), ("quotaExceeded", "quota_exceeded"), ("dailyLimitExceeded", "quota_exceeded"), ("keyInvalid", "api_configuration_error"), ("accessNotConfigured", "api_configuration_error"), ("invalidCriteria", "provider_request_error"), ("invalidParameter", "provider_request_error")):
+            failure = AdapterInternet([google_error(reason)]).fetch_public_json("https://www.googleapis.com/youtube/v3/search?key=SECRET")
+            require(failure.get("status") == 403 and failure.get("provider_reason") == reason and failure.get("error_code") == expected_code, f"Google error reason {reason} was not deliberately mapped.")
+            require("SECRET" not in json.dumps(failure) and "unsafe provider detail" not in json.dumps(failure), "Provider error normalization leaked a key, URL, or raw message.")
+        unavailable = AdapterInternet([google_error("backendError", 503)]).fetch_public_json("https://www.googleapis.com/youtube/v3/search?key=SECRET")
+        require(unavailable.get("error_code") == "provider_unavailable", "YouTube 5xx was not mapped to provider unavailable.")
+
+        class HTTPErrorAdapter(internet_module.InternetManager):
+            def __init__(self) -> None:
+                self._enabled = True
+
+            def _validate_public_url(self, url: str) -> str:
+                return url
+
+        error_headers = Message()
+        error_headers["Content-Type"] = "application/json; charset=utf-8"
+        error_body = json.dumps({"error": {"message": "raw unsafe message", "errors": [{"reason": "quotaExceeded"}]}}).encode("utf-8")
+        class RaisingOpener:
+            def open(self, request, timeout):
+                raise HTTPError(request.full_url, 403, "Forbidden", error_headers, io.BytesIO(error_body))
+        original_build_opener = internet_module.build_opener
+        internet_module.build_opener = lambda *handlers: RaisingOpener()
+        try:
+            http_failure = HTTPErrorAdapter().fetch_public_json("https://www.googleapis.com/youtube/v3/search?key=SECRET")
+        finally:
+            internet_module.build_opener = original_build_opener
+        require(http_failure.get("error_code") == "quota_exceeded" and http_failure.get("status") == 403, "Google JSON HTTPError body was not safely parsed and mapped.")
+        require("SECRET" not in json.dumps(http_failure) and "raw unsafe message" not in json.dumps(http_failure), "HTTPError adapter leaked its URL, key, or raw body.")
+
+        malformed_adapter_provider = providers_module.YouTubeDataProvider(api_key="SECRET", json_fetcher=AdapterInternet([{}]).fetch_public_json)
+        require(malformed_adapter_provider.discover_channels("broken").error_code == "malformed_response", "Malformed adapter success payload was accepted.")
+
+        requested_resources: list[str] = []
+        def fake_json_fetcher(url: str) -> dict[str, Any]:
+            parsed = urlsplit(url)
+            requested_resources.append(parsed.path.rsplit("/", 1)[-1])
+            require("key" in parse_qs(parsed.query), "Provider credential was not sent to YouTube.")
+            if parsed.path.endswith("/channels"):
+                return {"success": True, "data": {"items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU" + "a" * 22}}}]}}
+            if parsed.path.endswith("/playlistItems"):
+                return {"success": True, "data": {"items": [{"contentDetails": {"videoId": "aaaaaaaaaaa"}}, {"contentDetails": {"videoId": "bbbbbbbbbbb"}}, {"contentDetails": {"videoId": "ccccccccccc"}}]}}
+            if parsed.path.endswith("/videos"):
+                return {"success": True, "data": {"items": [
+                    {"id": "aaaaaaaaaaa", "snippet": {"publishedAt": "2026-01-01T00:00:00Z", "title": "Eligible", "channelTitle": "Markiplier", "channelId": creator.channel_id, "liveBroadcastContent": "none"}, "status": {"privacyStatus": "public", "embeddable": True}},
+                    {"id": "bbbbbbbbbbb", "snippet": {"publishedAt": "2026-02-01T00:00:00Z", "title": "Upcoming", "channelTitle": "Markiplier", "channelId": creator.channel_id, "liveBroadcastContent": "upcoming"}, "status": {"privacyStatus": "public", "embeddable": True}},
+                    {"id": "ccccccccccc", "snippet": {"publishedAt": "2026-03-01T00:00:00Z", "title": "Unembeddable", "channelTitle": "Markiplier", "channelId": creator.channel_id, "liveBroadcastContent": "none"}, "status": {"privacyStatus": "public", "embeddable": False}},
+                ]}}
+            raise AssertionError("Unexpected mocked provider path.")
+
+        provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=fake_json_fetcher)
+        lookup = provider.resolve_latest(creator)
+        require(lookup.success and lookup.media is not None, "Provider did not resolve an eligible upload.")
+        require(lookup.media.video_id == "aaaaaaaaaaa", "Eligibility filtering selected the wrong upload.")
+        require(requested_resources == ["channels", "playlistItems", "videos"], "Provider did not use the uploads-playlist lookup sequence.")
+        require("search" not in requested_resources, "YouTube search.list was used.")
+
+        discovery_requests: list[tuple[str, dict[str, list[str]]]] = []
+        first_channel_id = "UC" + "b" * 22
+        second_channel_id = "UC" + "c" * 22
+        def fake_discovery_fetcher(url: str) -> dict[str, Any]:
+            parsed = urlsplit(url)
+            query = parse_qs(parsed.query)
+            resource = parsed.path.rsplit("/", 1)[-1]
+            discovery_requests.append((resource, query))
+            if resource == "channels" and "forHandle" in query:
+                return {"success": True, "data": {"items": []}}
+            if resource == "search":
+                require(query.get("type") == ["channel"] and query.get("maxResults") == ["5"], "Discovery search was not channel-only and bounded.")
+                return {"success": True, "data": {"items": [{"id": {"channelId": first_channel_id}, "snippet": {"channelId": first_channel_id}}, {"id": {"channelId": second_channel_id}, "snippet": {"channelId": second_channel_id}}]}}
+            if resource == "channels" and "id" in query:
+                return {"success": True, "data": {"items": [
+                    {"id": first_channel_id, "snippet": {"title": "Alpha", "customUrl": "@Alpha", "description": "First candidate description"}, "statistics": {"subscriberCount": "12345"}},
+                    {"id": second_channel_id, "snippet": {"title": "Alpha Two", "description": "Second candidate"}, "statistics": {"hiddenSubscriberCount": True}},
+                ]}}
+            raise AssertionError("Unexpected discovery request.")
+
+        discovery_provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=fake_discovery_fetcher)
+        exact_miss = discovery_provider.resolve_exact_handle("@alpharad")
+        require(not exact_miss.success and exact_miss.error_code == "channel_not_found", "Exact handle miss was not reported deterministically.")
+        discovered = discovery_provider.discover_channels("alpharad")
+        require(len(discovered.candidates) == 2 and discovered.candidates[0].handle == "@Alpha", "Discovery candidates were not parsed.")
+        require(discovered.candidates[0].subscriber_count == 12345 and discovered.candidates[1].subscriber_count is None, "Public and hidden subscriber counts were not handled.")
+        require([item[0] for item in discovery_requests] == ["channels", "search", "channels"], "Exact handle and discovery request sequence was incorrect.")
+
+        empty_search_provider = providers_module.YouTubeDataProvider(
+            api_key="REGRESSION_YOUTUBE_KEY",
+            json_fetcher=lambda url: {"success": True, "data": {"items": []}},
+        )
+        empty_search = empty_search_provider.discover_channels("DefinitelyNotARealCreator123456")
+        require(not empty_search.success and empty_search.error_code == "channel_not_found", "Empty search results were classified as malformed.")
+
+        malformed_top_level_provider = providers_module.YouTubeDataProvider(
+            api_key="REGRESSION_YOUTUBE_KEY",
+            json_fetcher=lambda url: {"success": True, "data": []},
+        )
+        require(malformed_top_level_provider.discover_channels("broken").error_code == "malformed_response", "Malformed search top-level structure was accepted.")
+
+        mixed_candidate_requests: list[str] = []
+        def fake_mixed_candidate_fetcher(url: str) -> dict[str, Any]:
+            parsed = urlsplit(url)
+            resource = parsed.path.rsplit("/", 1)[-1]
+            mixed_candidate_requests.append(resource)
+            if resource == "search":
+                return {"success": True, "data": {"items": [None, {"snippet": {}}, {"id": {"channelId": first_channel_id}}]}}
+            return {"success": True, "data": {"items": [
+                {"id": second_channel_id, "snippet": {}},
+                {"id": first_channel_id, "snippet": {"title": "Alpha", "description": "Valid candidate"}, "statistics": {}},
+            ]}}
+        mixed_candidate_provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=fake_mixed_candidate_fetcher)
+        mixed_candidates = mixed_candidate_provider.discover_channels("alpha")
+        require(len(mixed_candidates.candidates) == 1 and mixed_candidates.candidates[0].channel_id == first_channel_id, "A malformed candidate prevented a valid candidate from resolving.")
+        require(mixed_candidate_requests == ["search", "channels"], "Mixed candidate discovery used an unexpected request sequence.")
+
+        all_malformed_provider = providers_module.YouTubeDataProvider(
+            api_key="REGRESSION_YOUTUBE_KEY",
+            json_fetcher=lambda url: {"success": True, "data": {"items": [None, {}, {"id": {"channelId": "invalid"}}]}},
+        )
+        all_malformed = all_malformed_provider.discover_channels("broken candidates")
+        require(all_malformed.error_code == "malformed_response", "All malformed search candidates were not classified as malformed.")
+
+        malformed_provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=lambda url: {"success": True, "data": {"items": {}}})
+        require(malformed_provider.resolve_exact_handle("@broken").error_code == "malformed_response", "Malformed exact response was accepted.")
+        quota_provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=lambda url: {"success": False, "error_code": "quota_exceeded", "error": "YouTube quota exhausted."})
+        require(quota_provider.resolve_exact_handle("@quota").error_code == "quota_exceeded", "Quota error was not preserved.")
+        invalid_handle_calls: list[str] = []
+        invalid_handle_provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=lambda url: invalid_handle_calls.append(url) or {})
+        require(invalid_handle_provider.resolve_exact_handle("@ab").error_code == "invalid_handle", "Invalid explicit handle was not rejected cleanly.")
+        require(not invalid_handle_calls, "Invalid explicit handle reached the provider transport.")
+        require(discovery_provider.validate_channel_id("UCshort").error_code == "invalid_channel_id", "Malformed direct channel ID was accepted.")
+        exact_provider = providers_module.YouTubeDataProvider(api_key="REGRESSION_YOUTUBE_KEY", json_fetcher=lambda url: {"success": True, "data": {"items": [{"id": first_channel_id, "snippet": {"title": "Alpha", "customUrl": "@Alpha", "description": "Exact"}, "statistics": {"subscriberCount": "12345"}}]}})
+        require(exact_provider.resolve_exact_handle("@Alpha").candidate.channel_id == first_channel_id, "Exact handle did not resolve.")
+        require(exact_provider.validate_channel_id(first_channel_id).candidate.channel_id == first_channel_id, "Exact channel ID did not validate.")
+
+        require(commands_module.parse_media_command("/play-latest Markiplier").action == "play_latest", "Play command parsing failed.")
+        require(commands_module.parse_media_command("/display pause").action == "pause", "Pause command parsing failed.")
+        require(commands_module.parse_media_command("/display status").action == "status", "Status command parsing failed.")
+        require(commands_module.parse_media_command("/display pause extra").error is not None, "Invalid display command was accepted.")
+        require(commands_module.parse_media_command("/creator-select 2").action == "creator_select", "Creator selection parsing failed.")
+        require(commands_module.parse_media_command("/creator-cancel").action == "creator_cancel", "Creator cancellation parsing failed.")
+        require(commands_module.parse_media_command("/creator aliases").action == "creator_aliases", "Creator alias listing parsing failed.")
+        require(commands_module.parse_media_command("/creator forget Alpha").action == "creator_forget", "Creator alias removal parsing failed.")
+
+        service_path = root / "service_media_settings.json"
+        service_path.write_text(json.dumps({"version": 1, "youtube": {"creator_aliases": {}}, "display": {"fullscreen": False}}), encoding="utf-8")
+        service_calls: list[str] = []
+        class FakeInternet:
+            is_enabled = True
+            def fetch_public_json(self, url: str) -> dict[str, Any]:
+                parsed = urlsplit(url)
+                query = parse_qs(parsed.query)
+                resource = parsed.path.rsplit("/", 1)[-1]
+                service_calls.append(resource)
+                if resource == "channels" and "forHandle" in query:
+                    if query["forHandle"] == ["@Alpha"]:
+                        return {"success": True, "data": {"items": [{"id": first_channel_id, "snippet": {"title": "Alpha", "customUrl": "@Alpha", "description": "One"}, "statistics": {"subscriberCount": "12345"}}]}}
+                    return {"success": True, "data": {"items": []}}
+                if resource == "search":
+                    if query.get("q") == ["DefinitelyNotARealCreator123456"]:
+                        return {"success": True, "data": {"items": []}}
+                    return {"success": True, "data": {"items": [{"id": {"channelId": first_channel_id}, "snippet": {"channelId": first_channel_id}}, {"id": {"channelId": second_channel_id}, "snippet": {"channelId": second_channel_id}}]}}
+                if resource == "channels" and query.get("part") == ["snippet,contentDetails,statistics"]:
+                    if query.get("id") == [first_channel_id]:
+                        return {"success": True, "data": {"items": [{"id": first_channel_id, "snippet": {"title": "Alpha", "customUrl": "@Alpha", "description": "One"}, "statistics": {"subscriberCount": "12345"}}]}}
+                    return {"success": True, "data": {"items": [{"id": first_channel_id, "snippet": {"title": "Alpha", "customUrl": "@Alpha", "description": "One"}, "statistics": {"subscriberCount": "12345"}}, {"id": second_channel_id, "snippet": {"title": "Alpha Two", "description": "Two"}, "statistics": {"hiddenSubscriberCount": True}}]}}
+                if resource == "channels":
+                    return {"success": True, "data": {"items": [{"contentDetails": {"relatedPlaylists": {"uploads": "UU" + "b" * 22}}}]}}
+                if resource == "playlistItems":
+                    return {"success": True, "data": {"items": [{"contentDetails": {"videoId": "ddddddddddd"}}]}}
+                if resource == "videos":
+                    return {"success": True, "data": {"items": [{"id": "ddddddddddd", "snippet": {"publishedAt": "2026-04-01T00:00:00Z", "title": "Latest Alpha", "channelTitle": "Alpha", "channelId": first_channel_id, "liveBroadcastContent": "none"}, "status": {"privacyStatus": "public", "embeddable": True}}]}}
+                raise AssertionError("Unexpected service provider request.")
+        class FakeDisplay:
+            def load_and_play(self, media):
+                return type("Result", (), {"success": True, "message": "ok"})()
+            def shutdown(self):
+                pass
+        service_log = audit_module.ToolAuditLog(root / "service_audit.db")
+        previous_key = os.environ.get("ELISE_YOUTUBE_API_KEY")
+        os.environ["ELISE_YOUTUBE_API_KEY"] = "REGRESSION_YOUTUBE_KEY"
+        service = commands_module.MediaCommandService(config_path=service_path, assets_directory=project_root / "display_assets", internet_manager=FakeInternet(), audit_log=service_log)
+        service._display = FakeDisplay()
+        try:
+            prompt = service.handle_command("/play-latest gaming")
+            require(prompt is not None and "Nothing was selected" in prompt, "Plain gaming query did not require selection.")
+            require(service_calls == ["search", "channels"], "Plain gaming query did not skip forHandle.")
+            require(config_module.MediaDisplayConfig.load(service_path).resolve_creator("gaming") is None, "Plain gaming query saved an alias before selection.")
+            service_calls.clear()
+            prompt = service.handle_command("/play-latest alpharad")
+            require(prompt is not None and "Nothing was selected" in prompt and "subscriber count hidden" in prompt, "Ambiguous discovery did not present candidates safely.")
+            require(service_calls == ["search", "channels"], "Uncached plain creator text did not skip forHandle.")
+            require(config_module.MediaDisplayConfig.load(service_path).resolve_creator("alpharad") is None, "Plain search saved an alias before selection.")
+            require(service._pending_selection is not None and service._pending_selection[0] == "alpharad", "Second play command did not replace the pending creator selection.")
+            require("invalid" in service.handle_command("/play-latest UCshort").casefold() and service._pending_selection is None, "Invalid exact channel ID did not replace a pending selection.")
+            require(service_calls == ["search", "channels"], "Invalid direct channel ID reached discovery or provider transport.")
+            prompt = service.handle_command("/play-latest alpharad")
+            require(service.handle_command("/creator-select 9") == "Elise: Selection must be between 1 and 2.", "Out-of-range selection was accepted.")
+            selected = service.handle_command("/creator-select 1")
+            require(selected is not None and "Latest Alpha" in selected, "Confirmed candidate did not continue latest-upload playback.")
+            saved = config_module.MediaDisplayConfig.load(service_path)
+            require(saved.resolve_creator("ALPHARAD").channel_id == first_channel_id, "Confirmed normalized alias was not persisted.")
+            service_calls.clear()
+            service.handle_command("/play-latest alpharad")
+            require("search" not in service_calls and service_calls == ["channels", "playlistItems", "videos"], "Saved alias did not bypass discovery.")
+            require(first_channel_id in service.handle_command("/creator aliases"), "Saved aliases were not listed.")
+            require("Forgot" in service.handle_command("/creator forget ALPHARAD"), "Normalized alias was not forgotten.")
+            service_calls.clear()
+            require("Latest Alpha" in service.handle_command("/play-latest @Alpha"), "Direct exact handle did not continue to playback.")
+            require("search" not in service_calls, "Direct exact handle incorrectly used broad search.")
+            service_calls.clear()
+            require("Latest Alpha" in service.handle_command(f"/play-latest {first_channel_id}"), "Direct channel ID did not continue to playback.")
+            require(service_calls == ["channels", "channels", "playlistItems", "videos"], "Direct channel ID did not use channel validation before playback.")
+            service_calls.clear()
+            no_match = service.handle_command("/play-latest DefinitelyNotARealCreator123456")
+            require(no_match == "Elise: No YouTube channel matched 'DefinitelyNotARealCreator123456'.", "Creator no-match response was not clean or deterministic.")
+            require(service_calls == ["search"], "31-character plain text did not go directly to search discovery.")
+            require(service._pending_selection is None, "A no-match response created a pending creator selection.")
+            secret_markers = ("REGRESSION_YOUTUBE_KEY", "googleapis.com", "Traceback", "Exception")
+            require(not any(marker in no_match for marker in secret_markers), "Creator no-match response leaked provider internals.")
+            audit_text = json.dumps(service_log.list_recent(10), default=str)
+            require(not any(marker in audit_text for marker in secret_markers), "Creator discovery audit entries leaked provider internals or credentials.")
+            service_calls.clear()
+            invalid_handle = service.handle_command("/play-latest @ab")
+            require(invalid_handle == "Elise: YouTube creator resolution failed: The YouTube handle is invalid.", "Invalid explicit handle did not return a clean error.")
+            require(service_calls == [], "Invalid explicit handle made a provider request.")
+            require(saved.save_alias(service_path, " Alpha  Rad ", first_channel_id).resolve_creator("alpha rad") is not None, "Alias normalization failed.")
+            try:
+                config_module.MediaDisplayConfig.load(service_path).save_alias(service_path, "alpha rad", second_channel_id)
+            except config_module.MediaConfigurationError:
+                pass
+            else:
+                raise AssertionError("Duplicate normalized alias was silently reassigned.")
+            service._pending_selection = ("old", discovered.candidates)
+            require(service.handle_command("/creator-cancel") == "Elise: Creator selection cancelled.", "Pending selection was not cancelled.")
+        finally:
+            service.shutdown()
+            release_resources(service_log)
+            if previous_key is None:
+                os.environ.pop("ELISE_YOUTUBE_API_KEY", None)
+            else:
+                os.environ["ELISE_YOUTUBE_API_KEY"] = previous_key
+
+        def run_discovery_command(search_payload: dict[str, Any]) -> tuple[str, object, list[str]]:
+            calls: list[str] = []
+            class ScenarioInternet:
+                is_enabled = True
+                def fetch_public_json(self, url: str) -> dict[str, Any]:
+                    parsed = urlsplit(url)
+                    query = parse_qs(parsed.query)
+                    resource = parsed.path.rsplit("/", 1)[-1]
+                    calls.append(resource)
+                    if resource == "channels" and "forHandle" in query:
+                        return {"success": True, "data": {"items": []}}
+                    if resource == "search":
+                        return {"success": True, "data": search_payload}
+                    if resource == "channels" and "id" in query:
+                        return {"success": True, "data": {"items": [
+                            {"id": first_channel_id, "snippet": {"title": "Pokemon", "customUrl": "@Pokemon", "description": "Valid candidate"}, "statistics": {"subscriberCount": "100"}},
+                        ]}}
+                    raise AssertionError("Unexpected scenario request.")
+            scenario_path = root / f"scenario_{len(list(root.glob('scenario_*.json')))}.json"
+            scenario_path.write_text(json.dumps({"version": 1, "youtube": {"creator_aliases": {}}, "display": {"fullscreen": False}}), encoding="utf-8")
+            scenario_log = audit_module.ToolAuditLog(root / f"scenario_{len(list(root.glob('scenario_*.db')))}.db")
+            scenario_service = commands_module.MediaCommandService(config_path=scenario_path, assets_directory=project_root / "display_assets", internet_manager=ScenarioInternet(), audit_log=scenario_log)
+            try:
+                response = scenario_service.handle_command("/play-latest pokemon channel")
+                assert response is not None
+                return response, scenario_service._pending_selection, calls
+            finally:
+                scenario_service.shutdown()
+                release_resources(scenario_log)
+
+        no_match_response, no_match_pending, no_match_calls = run_discovery_command({"items": []})
+        require(no_match_response == "Elise: No YouTube channel matched 'pokemon channel'.", "Handler did not return no-match for empty search items.")
+        require(no_match_pending is None and no_match_calls == ["search"], "Broad query did not skip forHandle and search directly.")
+
+        valid_search_item = {"id": {"channelId": first_channel_id}, "snippet": {"channelId": first_channel_id}}
+        candidate_response, candidate_pending, candidate_calls = run_discovery_command({"items": [valid_search_item]})
+        require("1. Pokemon" in candidate_response and candidate_pending is not None, "Valid search candidates did not create a numbered pending selection.")
+        require(candidate_calls == ["search", "channels"], "Broad-query discovery did not search directly before fetching channel details.")
+
+        mixed_response, mixed_pending, _ = run_discovery_command({"items": [None, valid_search_item]})
+        require("1. Pokemon" in mixed_response and mixed_pending is not None, "One malformed search candidate prevented a valid pending selection.")
+
+        missing_items_response, missing_items_pending, _ = run_discovery_command({})
+        require("malformed search response" in missing_items_response and missing_items_pending is None, "Missing search items was not rejected by the command handler.")
+
+        malformed_items_response, malformed_items_pending, _ = run_discovery_command({"items": [None, {}, {"id": {"channelId": "invalid"}}]})
+        require("malformed search response" in malformed_items_response and malformed_items_pending is None, "All malformed search candidates were reported as a no-match.")
+
+        class FakeProcess:
+            def __init__(self) -> None:
+                self.closed = False
+            def poll(self):
+                return 0 if self.closed else None
+            def terminate(self) -> None:
+                self.closed = True
+
+        launched: list[list[str]] = []
+        original_which = display_module.shutil.which
+        display_module.shutil.which = lambda name: "fake-msedge.exe" if name.startswith("msedge") else None
+        try:
+            controller = display_module.LocalDisplayController(assets_directory=project_root / "display_assets", browser_launcher=lambda command: launched.append(command) or FakeProcess())
+            result = controller.load_and_play(lookup.media)
+            require(result.success, "Local display did not start with mocked browser.")
+            require(len(launched) == 1 and "127.0.0.1" in " ".join(launched[0]), "Display browser was not launched against loopback.")
+            require(controller.snapshot().reported_status is None, "Playback was claimed before browser confirmation.")
+            server = controller._server
+            require(server is not None and server.server_address[0] == "127.0.0.1", "Display server did not bind only to loopback.")
+            port = server.server_address[1]
+            try:
+                urlopen(f"http://127.0.0.1:{port}/api/state", timeout=2)
+            except HTTPError as error:
+                require(error.code == 403, "Tokenless display API did not return forbidden.")
+                pass
+            else:
+                raise AssertionError("Tokenless display API request was accepted.")
+            token = controller._token
+            state = json.loads(urlopen(f"http://127.0.0.1:{port}/api/state?token={token}", timeout=2).read())
+            require(set(state) == {"revision", "action", "media"}, "Display state exposed unsupported data.")
+            require(set(state["media"]) == {"kind", "video_id", "title", "published_at", "channel_id", "channel_title"}, "Display payload exposed unsupported data.")
+            for reported_status in ("player_ready", "playing", "paused", "ended", "autoplay_blocked", "player_error"):
+                report = Request(f"http://127.0.0.1:{port}/api/report?token={token}", data=json.dumps({"status": reported_status, "video_id": lookup.media.video_id}).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+                urlopen(report, timeout=2).read()
+                require(controller.snapshot().reported_status == reported_status, f"{reported_status} status report was not retained.")
+            controller.close()
+            controller.shutdown()
+        finally:
+            display_module.shutil.which = original_which
+
+        log = audit_module.ToolAuditLog(root / "audit.db")
+        log.record(source="regression", request_text="/play-latest Markiplier", tool_name="media_display", arguments={"action": "play_latest", "video_id": lookup.media.video_id}, policy={"access_mode": "network_read", "risk_level": "medium", "permission_mode": "automatic", "requires_confirmation": False}, approved=True, result={"success": True}, result_summary="Display load requested.")
+        require("REGRESSION_YOUTUBE_KEY" not in str(log.list_recent(1)[0]["arguments_json"]), "YouTube API key leaked into audit data.")
+        release_resources(log)
+
+    return "Uploads-playlist lookup, mocked browser lifecycle, token API, status reports, typed payloads, and audit secrecy passed"
+
 
 def check_workflow_store(
     project_root: Path,
@@ -4252,7 +4650,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help=(
             "Run selected groups only. Repeat the option or use commas. "
             "Groups: structure, memory, memory-review, documents, tools, audit, "
-            "internet, workflow, workflow-execution, workflow-templates, app, "
+            "internet, media-display, workflow, workflow-execution, workflow-templates, app, "
             "live-internet, live-model."
         ),
     )
@@ -4445,6 +4843,13 @@ def main() -> int:
         "internet",
         "offline-safe settings, URL, and compression",
         lambda: check_internet_manager(
+            project_root
+        ),
+    )
+    runner.run(
+        "media-display",
+        "deterministic YouTube display lifecycle",
+        lambda: check_media_display(
             project_root
         ),
     )
