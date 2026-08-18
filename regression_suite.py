@@ -3551,6 +3551,8 @@ def check_media_display(project_root: Path) -> str:
                 ]}}
         query_internet, played_queries = QueryInternet(), []
         query_log = audit_module.ToolAuditLog(root / "query_service_audit.db")
+        previous_query_key = os.environ.get("ELISE_YOUTUBE_API_KEY")
+        os.environ["ELISE_YOUTUBE_API_KEY"] = "REGRESSION_YOUTUBE_KEY"
         query_service = commands_module.MediaCommandService(config_path=query_service_path, assets_directory=project_root / "display_assets", internet_manager=query_internet, audit_log=query_log)
         class QueryDisplay:
             def load_and_play(self, media):
@@ -3573,10 +3575,14 @@ def check_media_display(project_root: Path) -> str:
             require(query_service.handle_command("/video-select 1") == "Elise: No video selection is pending.", "A new search did not invalidate stale video selection.")
             query_service._pending_selection = ("other", (providers_module.CreatorCandidate(second_channel_id, "Other", None, None, ""),))
             query_service._pending_video_selection = (query_result.media[0],)
-            require(query_service._pending_selection is not None and query_service._pending_video_selection is not None, "Creator and video selection states were not separate.")
+            require(query_service._pending_selection is not None and query_service._pending_video_selection is not None, "Creator and video selection states were not separate.")        
         finally:
             query_service.shutdown()
             release_resources(query_log)
+            if previous_query_key is None:
+                os.environ.pop("ELISE_YOUTUBE_API_KEY", None)
+            else:
+                os.environ["ELISE_YOUTUBE_API_KEY"] = previous_query_key
 
         exact_id = "UC" + "j" * 22
         decoy_id = "UC" + "k" * 22
@@ -3695,15 +3701,33 @@ def check_media_display(project_root: Path) -> str:
                     raise AssertionError("Unexpected scenario request.")
             scenario_path = root / f"scenario_{len(list(root.glob('scenario_*.json')))}.json"
             scenario_path.write_text(json.dumps({"version": 1, "youtube": {"creator_aliases": {}}, "display": {"fullscreen": False}}), encoding="utf-8")
-            scenario_log = audit_module.ToolAuditLog(root / f"scenario_{len(list(root.glob('scenario_*.db')))}.db")
-            scenario_service = commands_module.MediaCommandService(config_path=scenario_path, assets_directory=project_root / "display_assets", internet_manager=ScenarioInternet(), audit_log=scenario_log)
+            scenario_log = audit_module.ToolAuditLog(
+                root / f"scenario_{len(list(root.glob('scenario_*.db')))}.db"
+            )
+            previous_scenario_key = os.environ.get("ELISE_YOUTUBE_API_KEY")
+            os.environ["ELISE_YOUTUBE_API_KEY"] = "REGRESSION_YOUTUBE_KEY"
+
+            scenario_service = commands_module.MediaCommandService(
+                config_path=scenario_path,
+                assets_directory=project_root / "display_assets",
+                internet_manager=ScenarioInternet(),
+                audit_log=scenario_log,
+            )
+
             try:
-                response = scenario_service.handle_command("/play-latest pokemon channel")
+                response = scenario_service.handle_command(
+                    "/play-latest pokemon channel"
+                )
                 assert response is not None
                 return response, scenario_service._pending_selection, calls
             finally:
                 scenario_service.shutdown()
                 release_resources(scenario_log)
+
+                if previous_scenario_key is None:
+                    os.environ.pop("ELISE_YOUTUBE_API_KEY", None)
+                else:
+                    os.environ["ELISE_YOUTUBE_API_KEY"] = previous_scenario_key
 
         no_match_response, no_match_pending, no_match_calls = run_discovery_command({"items": []})
         require(no_match_response == "Elise: No YouTube channel matched 'pokemon channel'.", "Handler did not return no-match for empty search items.")
