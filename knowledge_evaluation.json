@@ -1,0 +1,14 @@
+[
+  {"category":"computer science","query":"binary search algorithm","expected_title":"Binary search","expected_section":"Algorithm"},
+  {"category":"electrical engineering","query":"MOSFET transistor","expected_title":"MOSFET"},
+  {"category":"mathematics","query":"Pythagorean theorem","expected_title":"Pythagorean theorem"},
+  {"category":"physics","query":"general relativity gravitation","expected_title":"General relativity"},
+  {"category":"biology","query":"photosynthesis","expected_title":"Photosynthesis"},
+  {"category":"history","query":"Roman Empire","expected_title":"Roman Empire"},
+  {"category":"geography","query":"New York City","expected_title":"New York City"},
+  {"category":"major public figures","query":"Julius Caesar","expected_title":"Julius Caesar"},
+  {"category":"literature","query":"Pride and Prejudice novel","expected_title":"Pride and Prejudice"},
+  {"category":"film / entertainment","query":"Spider-Man fictional character","expected_title":"Spider-Man"},
+  {"category":"general concepts","query":"democracy form of government","expected_title":"Democracy"},
+  {"category":"negative","query":"zxqv nonexistent topic","expected_title":null}
+]

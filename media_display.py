@@ -15,7 +15,7 @@ import shutil
 from media_models import DisplayActionResult, DisplayReportStatus, DisplaySnapshot, YouTubeMediaPayload
 
 
-_ALLOWED_REPORTS: set[str] = {"player_ready", "playing", "paused", "ended", "autoplay_blocked", "player_error"}
+_ALLOWED_REPORTS: set[str] = {"player_ready", "playing", "playing_muted", "paused", "ended", "autoplay_blocked", "player_error"}
 
 
 class LocalDisplayController:
@@ -26,11 +26,21 @@ class LocalDisplayController:
         *,
         assets_directory: str | Path,
         fullscreen: bool = False,
+        autoplay: bool = True,
+        autoplay_with_sound: bool = True,
+        volume: int = 100,
+        edge_autoplay_override: bool = True,
+        profile_directory: str | Path | None = None,
         browser_launcher: Callable[[list[str]], Any] | None = None,
     ) -> None:
         self._assets_directory = Path(assets_directory)
         self._fullscreen = fullscreen
-        self._browser_launcher = browser_launcher or (lambda command: Popen(command))
+        self._browser_launcher = browser_launcher or (lambda command: Popen(command, shell=False))
+        self._autoplay = autoplay
+        self._autoplay_with_sound = autoplay_with_sound
+        self._volume = max(0, min(100, int(volume)))
+        self._edge_autoplay_override = edge_autoplay_override
+        self._profile_directory = Path(profile_directory) if profile_directory else self._assets_directory.parent / "data" / "edge_display_profile"
         self._lock = Lock()
         self._token = secrets.token_urlsafe(32)
         self._server: ThreadingHTTPServer | None = None
@@ -113,7 +123,7 @@ class LocalDisplayController:
                         return
                     with controller._lock:
                         media = controller._media.to_display_dict() if controller._media else None
-                        self._send_json({"revision": controller._revision, "action": controller._desired_action, "media": media})
+                        self._send_json({"revision": controller._revision, "action": controller._desired_action, "media": media, "playback": {"autoplay": controller._autoplay, "autoplay_with_sound": controller._autoplay_with_sound, "volume": controller._volume}})
                     return
                 self.send_error(HTTPStatus.NOT_FOUND)
 
@@ -169,7 +179,10 @@ class LocalDisplayController:
         assert self._server is not None
         port = int(self._server.server_address[1])
         url = f"http://127.0.0.1:{port}/?token={self._token}"
-        command = [browser, f"--app={url}", "--no-first-run", "--new-window"]
+        self._profile_directory.mkdir(parents=True, exist_ok=True)
+        command = [browser, f"--app={url}", "--no-first-run", "--new-window", f"--user-data-dir={self._profile_directory.resolve()}"]
+        if self._edge_autoplay_override:
+            command.append("--autoplay-policy=no-user-gesture-required")
         if self._fullscreen:
             command.append("--start-fullscreen")
         return command
@@ -187,9 +200,10 @@ class LocalDisplayController:
                 self._reported_status = None
             self._set_action("load", "Waiting for the display player.")
             self._ensure_window()
-        except (OSError, RuntimeError) as error:
+        except (OSError, RuntimeError):
+            self.close()
             self._set_action("idle", "Display window could not be opened.")
-            return DisplayActionResult(False, f"Display window could not be opened: {error}", self.snapshot())
+            return DisplayActionResult(False, "Display window could not be opened.", self.snapshot())
         return DisplayActionResult(True, "Display requested; waiting for player status.", self.snapshot())
 
     def pause(self) -> DisplayActionResult:
@@ -210,10 +224,6 @@ class LocalDisplayController:
             self._process.terminate()
         self._process = None
         self._reported_status = None
-        return DisplayActionResult(True, "Display window closed.", self.snapshot())
-
-    def shutdown(self) -> None:
-        self.close()
         server = self._server
         thread = self._server_thread
         self._server = None
@@ -223,3 +233,7 @@ class LocalDisplayController:
             server.server_close()
         if thread is not None:
             thread.join(timeout=2)
+        return DisplayActionResult(True, "Display window closed.", self.snapshot())
+
+    def shutdown(self) -> None:
+        self.close()

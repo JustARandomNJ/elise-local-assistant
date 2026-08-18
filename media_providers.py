@@ -5,7 +5,7 @@ from typing import Any, Callable
 from urllib.parse import urlencode
 import re
 
-from media_models import CreatorCandidate, CreatorResolutionResult, CreatorTarget, ProviderLookupResult, YouTubeMediaPayload
+from media_models import CreatorCandidate, CreatorResolutionResult, CreatorTarget, ProviderLookupResult, ProviderSearchResult, VideoQueryOrdering, YouTubeMediaPayload
 
 
 _VIDEO_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{11}$")
@@ -253,3 +253,58 @@ class YouTubeDataProvider:
             return ProviderLookupResult(False, error_code="no_eligible_upload", error_message="No eligible public upload was found.")
         selected = max(eligible, key=lambda item: (item.published_at, item.video_id))
         return ProviderLookupResult(success=True, media=selected)
+
+    def search_videos(self, creator: CreatorTarget, query: str, ordering: VideoQueryOrdering) -> ProviderSearchResult:
+        """Search only within a validated creator channel, then validate every result."""
+
+        order_map = {"relevance": "relevance", "date": "date", "view_count": "viewCount"}
+        if ordering not in order_map or not _CHANNEL_ID_PATTERN.fullmatch(creator.channel_id) or not query.strip():
+            return ProviderSearchResult(False, error_code="invalid_query", error_message="The video search request was invalid.")
+        search = self._request("search", {
+            "part": "snippet", "type": "video", "channelId": creator.channel_id,
+            "q": query, "maxResults": "10", "videoEmbeddable": "true", "order": order_map[ordering],
+        })
+        if not search.get("success"):
+            failure = self._failure(search, "Unable to search this creator's videos.")
+            return ProviderSearchResult(False, error_code=failure.error_code, error_message=failure.error_message)
+        items = self._items(search)
+        if items is None:
+            return ProviderSearchResult(False, error_code="malformed_response", error_message="YouTube returned a malformed video search response.")
+        ids: list[str] = []
+        for item in items:
+            raw_id = item.get("id", {}).get("videoId") if isinstance(item, dict) and isinstance(item.get("id"), dict) else None
+            if isinstance(raw_id, str) and _VIDEO_ID_PATTERN.fullmatch(raw_id) and raw_id not in ids:
+                ids.append(raw_id)
+        if not ids:
+            return ProviderSearchResult(False, error_code="no_matching_videos", error_message="No matching eligible videos were found.")
+        videos = self._request("videos", {
+            "part": "snippet,status,liveStreamingDetails,contentDetails", "id": ",".join(ids), "maxResults": str(len(ids)),
+        })
+        if not videos.get("success"):
+            failure = self._failure(videos, "Unable to validate matching videos.")
+            return ProviderSearchResult(False, error_code=failure.error_code, error_message=failure.error_message)
+        video_items = self._items(videos)
+        if video_items is None:
+            return ProviderSearchResult(False, error_code="malformed_response", error_message="YouTube returned malformed video details.")
+        by_id: dict[str, YouTubeMediaPayload] = {}
+        for item in video_items:
+            if not isinstance(item, dict):
+                continue
+            video_id, snippet, status = item.get("id"), item.get("snippet"), item.get("status")
+            if not isinstance(video_id, str) or not _VIDEO_ID_PATTERN.fullmatch(video_id) or video_id not in ids:
+                continue
+            if not isinstance(snippet, dict) or not isinstance(status, dict):
+                continue
+            if status.get("privacyStatus") != "public" or status.get("embeddable") is not True:
+                continue
+            if snippet.get("liveBroadcastContent") == "upcoming":
+                continue
+            published_at = self._timestamp(snippet.get("publishedAt"))
+            title, channel_id, channel_title = snippet.get("title"), snippet.get("channelId"), snippet.get("channelTitle")
+            if channel_id != creator.channel_id or not published_at or not all(isinstance(v, str) and v.strip() for v in (title, channel_title)):
+                continue
+            by_id[video_id] = YouTubeMediaPayload(video_id, title.strip(), published_at, channel_id, channel_title.strip())
+        eligible = tuple(by_id[video_id] for video_id in ids if video_id in by_id)
+        if not eligible:
+            return ProviderSearchResult(False, error_code="no_matching_videos", error_message="No matching eligible videos were found.")
+        return ProviderSearchResult(True, media=eligible)

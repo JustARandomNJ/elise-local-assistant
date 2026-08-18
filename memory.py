@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import date, datetime, time, timezone
 import json
+import os
 import re
 import sqlite3
 from pathlib import Path
@@ -15,6 +16,11 @@ ALLOWED_CATEGORIES = {
     "goal",
     "project",
     "observation",
+    "relationship_context",
+    "routine",
+    "constraint",
+    "skill",
+    "communication_style",
 }
 
 ALLOWED_STATUSES = {
@@ -29,9 +35,11 @@ ALLOWED_PRIVACY_LEVELS = {
 }
 
 ALLOWED_RETRIEVAL_POLICIES = {
+    "always_relevant",
     "when_relevant",
     "explicit_only",
     "never_prompt",
+    "never_model_context",
 }
 
 ALLOWED_SUGGESTION_RELATIONS = {
@@ -96,7 +104,32 @@ MEMORY_SEARCH_STOP_WORDS = {
     "would",
     "you",
     "your",
+    "like",
+    "but",
+    "instead",
+    "personal",
+    "useful",
+    "project",
 }
+
+_MEMORY_MIN_RELEVANCE_FALLBACK = 3.4
+
+
+def _parse_memory_min_relevance(value: str | None) -> float:
+    if value is None:
+        return _MEMORY_MIN_RELEVANCE_FALLBACK
+    try:
+        return float(value)
+    except ValueError:
+        return _MEMORY_MIN_RELEVANCE_FALLBACK
+
+
+DEFAULT_MEMORY_MIN_RELEVANCE = _parse_memory_min_relevance(
+    os.environ.get("ELISE_MEMORY_MIN_RELEVANCE")
+)
+DEFAULT_PERSONAL_MEMORY_MIN_RELEVANCE = _parse_memory_min_relevance(
+    os.environ.get("ELISE_MEMORY_PERSONAL_MIN_RELEVANCE")
+)
 
 
 MEMORY_QUERY_EXPANSIONS = {
@@ -155,6 +188,12 @@ MEMORY_QUERY_EXPANSIONS = {
         "computer",
         "board",
     },
+}
+
+MEMORY_SEMANTIC_EXPANSION_TERMS = {
+    term
+    for terms in MEMORY_QUERY_EXPANSIONS.values()
+    for term in terms
 }
 
 
@@ -699,6 +738,7 @@ class MemoryStore:
         explicit: bool = False,
         retrieval_context: str = "automatic_chat",
         log_retrieval: bool = True,
+        min_relevance: float = DEFAULT_MEMORY_MIN_RELEVANCE,
     ) -> list[sqlite3.Row]:
         """Retrieve policy-eligible, non-expired memories relevant to a query."""
         cleaned_query = query.strip()
@@ -713,7 +753,7 @@ class MemoryStore:
         scored: list[tuple[float, int, str, str]] = []
         for memory in all_memories:
             policy = str(memory["retrieval_policy"])
-            if policy == "never_prompt":
+            if policy in {"never_prompt", "never_model_context"}:
                 continue
             if policy == "explicit_only" and not explicit:
                 continue
@@ -739,7 +779,8 @@ class MemoryStore:
                 if token in metadata_tokens:
                     matched_tokens.add(token)
                     base_score += 1.5
-            if not matched_tokens:
+            always_relevant = policy == "always_relevant"
+            if not matched_tokens and not always_relevant:
                 continue
             coverage = len(matched_tokens) / len(unique_query_tokens)
             base_score += coverage * 4.0
@@ -748,12 +789,40 @@ class MemoryStore:
                 base_score += 5.0
             if len(matched_tokens) == len(unique_query_tokens):
                 base_score += 2.0
+            if always_relevant:
+                base_score = max(base_score, min_relevance + 5.0)
             final_score = base_score * STATUS_WEIGHTS.get(status, 0.75) * (0.5 + confidence * 0.5)
+            if str(memory["privacy_level"]) == "personal" and not explicit:
+                # Personal context must clear a meaningfully stronger bar than
+                # ordinary preferences; lexical overlap alone is insufficient.
+                final_score *= 0.75
             terms = ", ".join(sorted(matched_tokens))
             reason = (
                 f"{retrieval_context} matched terms: {terms}; "
                 f"privacy={memory['privacy_level']}; policy={policy}"
             )
+            distinctive_overlap = any(
+                len(token) >= 6 or "-" in token or any(char.isdigit() for char in token)
+                for token in matched_tokens
+            )
+            semantic_overlap = any(token in MEMORY_SEMANTIC_EXPANSION_TERMS for token in matched_tokens)
+            if distinctive_overlap:
+                final_score += 2.0
+            if semantic_overlap:
+                final_score += 2.0
+            effective_min_relevance = (
+                max(min_relevance, DEFAULT_PERSONAL_MEMORY_MIN_RELEVANCE + 1.0)
+                if str(memory["privacy_level"]) == "personal" and not explicit
+                else min_relevance
+            )
+            if (not always_relevant and final_score < effective_min_relevance) or (
+                not explicit
+                and not always_relevant
+                and len(matched_tokens) < 2
+                and not distinctive_overlap
+                and not semantic_overlap
+            ):
+                continue
             scored.append((final_score, int(memory["id"]), terms, reason))
         scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
         rows: list[sqlite3.Row] = []

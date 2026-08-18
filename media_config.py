@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -26,6 +27,11 @@ def normalize_creator_alias(value: str) -> str:
 class MediaDisplayConfig:
     creator_aliases: dict[str, CreatorTarget]
     fullscreen: bool = False
+    autoplay: bool = True
+    autoplay_with_sound: bool = True
+    volume: int = 100
+    edge_autoplay_override: bool = True
+    open_music_console_on_play: bool = True
 
     @classmethod
     def load(cls, path: str | Path) -> "MediaDisplayConfig":
@@ -44,7 +50,7 @@ class MediaDisplayConfig:
         if not isinstance(raw, dict):
             raise MediaConfigurationError("Media display configuration must be an object.")
 
-        if set(raw) - {"version", "youtube", "display"}:
+        if set(raw) - {"version", "youtube", "display", "spotify"}:
             raise MediaConfigurationError("Media display configuration contains unsupported fields.")
         if raw.get("version") != 1:
             raise MediaConfigurationError("Media display configuration requires version 1.")
@@ -73,12 +79,30 @@ class MediaDisplayConfig:
             targets[normalized] = CreatorTarget(alias=alias.strip(), channel_id=channel_id)
 
         display = raw.get("display", {})
-        if not isinstance(display, dict) or set(display) - {"fullscreen"}:
+        if not isinstance(display, dict) or set(display) - {"fullscreen", "autoplay", "autoplay_with_sound", "volume", "edge_autoplay_override"}:
             raise MediaConfigurationError("Display configuration contains unsupported fields.")
         fullscreen = display.get("fullscreen", False)
         if not isinstance(fullscreen, bool):
             raise MediaConfigurationError("display.fullscreen must be true or false.")
-        return cls(creator_aliases=targets, fullscreen=fullscreen)
+        autoplay = display.get("autoplay", True)
+        autoplay_with_sound = display.get("autoplay_with_sound", True)
+        edge_autoplay_override = display.get("edge_autoplay_override", True)
+        volume = display.get("volume", 100)
+        if not isinstance(autoplay, bool) or not isinstance(autoplay_with_sound, bool) or not isinstance(edge_autoplay_override, bool):
+            raise MediaConfigurationError("Display playback settings must be true or false.")
+        if isinstance(volume, bool) or not isinstance(volume, (int, float)) or not math.isfinite(volume):
+            raise MediaConfigurationError("display.volume must be a number.")
+        volume = max(0, min(100, int(volume)))
+        spotify = raw.get("spotify", {})
+        if not isinstance(spotify, dict) or set(spotify) - {"open_music_console_on_play"}:
+            raise MediaConfigurationError("Spotify configuration contains unsupported fields.")
+        open_music_console_on_play = spotify.get("open_music_console_on_play", True)
+        if not isinstance(open_music_console_on_play, bool):
+            raise MediaConfigurationError("spotify.open_music_console_on_play must be true or false.")
+        return cls(targets, fullscreen, autoplay, autoplay_with_sound, volume, edge_autoplay_override, open_music_console_on_play)
+
+    def _display_dict(self) -> dict[str, bool | int]:
+        return {"fullscreen": self.fullscreen, "autoplay": self.autoplay, "autoplay_with_sound": self.autoplay_with_sound, "volume": self.volume, "edge_autoplay_override": self.edge_autoplay_override}
 
     def resolve_creator(self, alias: str) -> CreatorTarget | None:
         return self.creator_aliases.get(normalize_creator_alias(alias))
@@ -95,7 +119,8 @@ class MediaDisplayConfig:
         payload = {
             "version": 1,
             "youtube": {"creator_aliases": {key: {"channel_id": target.channel_id} for key, target in sorted(updated.items())}},
-            "display": {"fullscreen": self.fullscreen},
+            "display": self._display_dict(),
+            "spotify": {"open_music_console_on_play": self.open_music_console_on_play},
         }
         config_path = Path(path)
         config_path.parent.mkdir(parents=True, exist_ok=True)
@@ -105,7 +130,7 @@ class MediaDisplayConfig:
             temporary.replace(config_path)
         except OSError as error:
             raise MediaConfigurationError("Media display configuration could not be saved.") from error
-        return MediaDisplayConfig(updated, self.fullscreen)
+        return MediaDisplayConfig(updated, self.fullscreen, self.autoplay, self.autoplay_with_sound, self.volume, self.edge_autoplay_override, self.open_music_console_on_play)
 
     def forget_alias(self, path: str | Path, alias: str) -> tuple["MediaDisplayConfig", bool]:
         normalized = normalize_creator_alias(alias)
@@ -114,7 +139,7 @@ class MediaDisplayConfig:
         updated = dict(self.creator_aliases)
         del updated[normalized]
         # Reuse the same strict, public-only serialization shape.
-        payload = {"version": 1, "youtube": {"creator_aliases": {key: {"channel_id": target.channel_id} for key, target in sorted(updated.items())}}, "display": {"fullscreen": self.fullscreen}}
+        payload = {"version": 1, "youtube": {"creator_aliases": {key: {"channel_id": target.channel_id} for key, target in sorted(updated.items())}}, "display": self._display_dict(), "spotify": {"open_music_console_on_play": self.open_music_console_on_play}}
         config_path = Path(path)
         temporary = config_path.with_suffix(config_path.suffix + ".tmp")
         try:
@@ -122,7 +147,7 @@ class MediaDisplayConfig:
             temporary.replace(config_path)
         except OSError as error:
             raise MediaConfigurationError("Media display configuration could not be saved.") from error
-        return MediaDisplayConfig(updated, self.fullscreen), True
+        return MediaDisplayConfig(updated, self.fullscreen, self.autoplay, self.autoplay_with_sound, self.volume, self.edge_autoplay_override, self.open_music_console_on_play), True
 
 
 def read_youtube_api_key() -> str:

@@ -5,9 +5,58 @@ from datetime import datetime
 from typing import Literal
 
 
+VideoQueryOrdering = Literal["relevance", "date", "view_count"]
+
+
+@dataclass(frozen=True)
+class MediaVideoQuery:
+    creator: str
+    query: str
+    ordering: VideoQueryOrdering = "relevance"
+    list_only: bool = False
+
+
+@dataclass(frozen=True)
+class MediaMusicQuery:
+    query: str
+    artist: str | None = None
+    album: str | None = None
+    list_only: bool = False
+    provider: Literal["spotify"] = "spotify"
+
+
+@dataclass(frozen=True)
+class SpotifyTrackResult:
+    id: str
+    uri: str
+    name: str
+    artists: tuple[str, ...]
+    album: str
+    duration_ms: int
+    explicit: bool
+
+
+@dataclass(frozen=True)
+class SpotifyDevice:
+    id: str
+    name: str
+    type: str
+    is_active: bool
+    is_restricted: bool
+
+
+@dataclass(frozen=True)
+class SpotifySearchResult:
+    success: bool
+    tracks: tuple[SpotifyTrackResult, ...] = ()
+    error_code: str | None = None
+    error_message: str | None = None
+
+
 DisplayReportStatus = Literal[
     "player_ready",
     "playing",
+    "playing_muted",
     "paused",
     "ended",
     "autoplay_blocked",
@@ -66,6 +115,14 @@ class YouTubeMediaPayload:
 class ProviderLookupResult:
     success: bool
     media: YouTubeMediaPayload | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True)
+class ProviderSearchResult:
+    success: bool
+    media: tuple[YouTubeMediaPayload, ...] = ()
     error_code: str | None = None
     error_message: str | None = None
 

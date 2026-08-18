@@ -1,0 +1,22 @@
+[
+  {"id":"durable_preference","text":"I prefer explanations with concrete examples.","candidate":true,"category":"preference","durability":"durable","privacy":"ordinary","action":"auto_store"},
+  {"id":"temporary_preference","text":"For tonight, I prefer a short answer.","candidate":false,"durability":"ephemeral","action":"discard"},
+  {"id":"project","text":"I'm building a compiler as my main project.","candidate":true,"category":"project","durability":"durable","privacy":"personal"},
+  {"id":"goal","text":"My long-term goal is to learn systems programming.","candidate":true,"category":"goal","durability":"durable","privacy":"personal"},
+  {"id":"routine","text":"I review my weekly plan every Sunday.","candidate":true,"category":"routine","durability":"durable","privacy":"ordinary"},
+  {"id":"skill","text":"I am proficient in Python.","candidate":true,"category":"skill","durability":"durable","privacy":"ordinary"},
+  {"id":"sensitive","text":"I have a durable medical condition that affects future planning.","candidate":true,"privacy":"sensitive","retrieval_policy":"explicit_only"},
+  {"id":"api_key","text":"My API key is sk-exampleexampleexample.","candidate":false,"privacy":"secret","action":"reject_secret"},
+  {"id":"password","text":"My password is: example-password.","candidate":false,"privacy":"secret","action":"reject_secret"},
+  {"id":"venting","text":"This build is driving me crazy tonight.","candidate":false,"action":"discard"},
+  {"id":"hypothetical","text":"Suppose that I prefer dark mode.","candidate":false,"action":"discard"},
+  {"id":"quoted","text":"They wrote: 'I prefer dark mode.'", "candidate":false,"action":"discard"},
+  {"id":"rewrite","text":"Rewrite this: I prefer dark mode.","candidate":false,"action":"discard"},
+  {"id":"translation","text":"Translate: I prefer dark mode.","candidate":false,"action":"discard"},
+  {"id":"sarcasm","text":"Oh sure, I just love unexplained stack traces.","candidate":false,"action":"discard"},
+  {"id":"correction","text":"Correction: I primarily use Rust, not Python.","candidate":true,"relation":"update","durability":"durable"},
+  {"id":"contradiction","text":"I now prefer detailed answers instead of concise ones.","candidate":true,"relation":"contradiction","durability":"durable"},
+  {"id":"third_party","text":"My coworker's password is: example-password.","candidate":false,"privacy":"secret","action":"reject_secret"},
+  {"id":"temporary_location","text":"I'm in San Diego this weekend.","candidate":false,"durability":"short_term","action":"discard"},
+  {"id":"document_content","text":"Summarize this document: the author prefers dark mode.","candidate":false,"action":"discard"}
+]
