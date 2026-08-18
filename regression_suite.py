@@ -5098,7 +5098,7 @@ def check_app_pure_functions(
     banner_examples = {
         "write HELLO in ascii": "HELLO",
         "write Elise in ascii": "Elise",
-        "make AI in ascii letters": "NJ",
+        "make AI in ascii letters": "AI",
         "spell Spider-Man in ascii": "Spider-Man",
         "ascii text saying hello": "hello",
         "make an ascii banner saying O'Brien.": "O'Brien.",
