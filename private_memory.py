@@ -18,6 +18,7 @@ KDF_ITERATIONS = 600_000
 ALLOWED_PRIVATE_POLICIES = {
     "explicit_only",
     "never_prompt",
+    "never_model_context",
 }
 ALLOWED_CATEGORIES = {
     "fact",
@@ -25,6 +26,11 @@ ALLOWED_CATEGORIES = {
     "goal",
     "project",
     "observation",
+    "relationship_context",
+    "routine",
+    "constraint",
+    "skill",
+    "communication_style",
 }
 
 

@@ -21,6 +21,11 @@ imports/
 .env
 *.env
 internet_settings.json
+media_display_settings.json
+spotify_tokens.json
+data/spotify_tokens.json
+media_display_browser_profile/
+data/edge_display_profile/
 
 # Logs and temporary files
 *.log
@@ -38,7 +43,9 @@ Thumbs.db
 # Elise backups and bundles
 *_backup.py
 Elise_*.zip
-elise_*_files.zip# Elise regression reports
+elise_*_files.zip
+
+# Elise regression reports
 regression_reports/
 .regression_reports/
 
@@ -47,3 +54,5 @@ elise-regression-*/
 
 # Private local memory profiles
 profiles/*.json
+
+/profile.json
